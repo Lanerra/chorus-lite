@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chorus-Lite Web Interface</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Chorus-Lite Web Interface</h1>
+            <p>Enter your story idea and generate a novel with AI agents</p>
+        </header>
+
+        <main>
+            <!-- Story Idea Form -->
+            <section class="form-section">
+                <h2>Generate Your Story</h2>
+                <form id="story-form">
+                    <div class="form-group">
+                        <label for="story-idea">Story Idea:</label>
+                        <textarea id="story-idea" name="story-idea" rows="3" placeholder="Enter your story idea here..." required></textarea>
+                    </div>
+                    <button type="submit" id="generate-btn">Generate</button>
+                </form>
+            </section>
+
+            <!-- Status Display -->
+            <section class="status-section">
+                <h2>Current Status</h2>
+                <div class="status-grid">
+                    <div class="status-card">
+                        <h3>Chapter</h3>
+                        <p id="current-chapter">-</p>
+                    </div>
+                    <div class="status-card">
+                        <h3>Scene</h3>
+                        <p id="current-scene">-</p>
+                    </div>
+                    <div class="status-card">
+                        <h3>Chapters Left</h3>
+                        <p id="chapters-left">-</p>
+                    </div>
+                    <div class="status-card">
+                        <h3>Scenes Left</h3>
+                        <p id="scenes-left">-</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Live Log Output -->
+            <section class="logs-section">
+                <h2>Live Log Output</h2>
+                <div id="log-container" class="log-container">
+                    <div class="log-entry">Connecting to story generation system...</div>
+                </div>
+            </section>
+
+            <!-- Database Content Display -->
+            <section class="database-section">
+                <h2>Database Content</h2>
+                
+                <!-- Characters Section -->
+                <div class="category-section">
+                    <h3>Characters</h3>
+                    <div id="characters-list" class="list-container">
+                        <div class="list-item">Loading characters...</div>
+                    </div>
+                </div>
+
+                <!-- Chapters Section -->
+                <div class="category-section">
+                    <h3>Chapters</h3>
+                    <div id="chapters-list" class="list-container">
+                        <div class="list-item">Loading chapters...</div>
+                    </div>
+                </div>
+
+                <!-- Scenes Section -->
+                <div class="category-section">
+                    <h3>Scenes</h3>
+                    <div id="scenes-list" class="list-container">
+                        <div class="list-item">Loading scenes...</div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <p>Chorus-Lite © 2025 - An autonomous, agentic, creative-writing system</p>
+        </footer>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

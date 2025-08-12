@@ -1,0 +1,29 @@
+# Chorus Services
+#
+# To run: docker compose up -d
+# To stop: docker compose down
+# To stop and remove volumes: docker compose down -v
+#
+services:
+  chorus-postgres:
+    image: pgvector/pgvector:pg16 # Uses pgvector-enabled Postgres image (v16+); changing images may require `docker compose down -v` to reset data
+    container_name: chorus-postgres
+    restart: always
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - chorus-pg-data:/var/lib/postgresql/data
+      - ./pgvector-init.sql/01-pgvector-init.sql:/docker-entrypoint-initdb.d/01-pgvector-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+volumes:
+  chorus-pg-data:

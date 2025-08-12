@@ -1,0 +1,59 @@
+# New Consolidated Agent Configuration
+# These agents replace the specialized agents below for improved efficiency
+
+story_architect:
+  model: "openai/qwen3-30b-a3b"  # Use the actual model from .env
+  # Concept generation settings (from maestro)
+  rubric: |
+    1. Originality of the premise
+    2. Strength of conflict
+    3. Clarity of theme
+  num_concepts: 5
+  surprise_me: false  # Whether to use surprise mode for concept selection
+  review_cycle_timeout: 3600  # Timeout for review cycles in seconds (1 hour)
+  # Story planning settings (from architect)
+  max_scenes_per_chapter: 10  # Maximum scenes per chapter
+  scene_length_target: 500  # Target word count per scene
+  # Character development settings (from character_architect)
+  max_characters_per_scene: 6  # Maximum characters to appear in a single scene
+  profile_depth: "detailed"  # Profile detail level: "basic" or "detailed"
+  # World building settings (from lorekeeper)
+  max_world_entries_per_concept: 5  # Maximum world entries to create per concept
+  discovery_threshold: 0.7  # Minimum confidence for new discoveries (0-1)
+
+scene_generator:
+  model: "openai/qwen3-30b-a3b"  # Use the actual model from .env
+  # Scene writing settings (from scene_writer)
+  context_window_size: 3  # Number of recent scenes to use as context
+  max_scene_length: 1000  # Maximum word count per scene
+  style_guide_enforcement: "lenient"  # Style enforcement: "lenient", "moderate", or "strict"
+  # Coherence checking settings (replaces continuity and style checks)
+  coherence_check_enabled: true  # Enable single-pass coherence validation
+  min_word_count: 100  # Minimum words required for scene approval
+  min_paragraphs: 2  # Minimum paragraphs required for scene structure
+  character_consistency_check: true  # Verify character names from brief appear in scene
+  # Concurrent processing settings
+  max_concurrent_scenes: 3  # Maximum scenes to process concurrently
+
+integration_manager:
+  model: "openai/qwen3-30b-a3b"  # Use the actual model from .env
+  # Integration settings (from integration_agent)
+  dual_write_timeout: 60  # Seconds timeout for dual-write operations
+  retry_attempts: 3  # Number of retry attempts for failed operations
+  # Quality assurance settings
+  validation_depth: "comprehensive"  # Validation level: "basic", "standard", or "comprehensive"
+  consistency_threshold: 0.85  # Minimum consistency score for story validation (0-1)
+
+# Legacy Agent Configuration (maintained for backward compatibility)
+# These configurations are kept to ensure existing setups continue to work
+
+# Legacy agent configurations removed - replaced by coherence_check in scene_generator
+# continuity_guardian and style_editor are no longer used in the simplified workflow
+
+
+
+# Global Configuration
+worker:
+  task_timeout: 1800  # Seconds timeout for individual tasks (30 minutes)
+  max_concurrent_tasks: 5  # Maximum number of concurrent tasks
+  retry_delay: 10  # Seconds delay between retry attempts

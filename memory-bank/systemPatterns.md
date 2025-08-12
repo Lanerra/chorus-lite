@@ -147,3 +147,32 @@ class ChorusConfig(BaseModel):
    - Real-time monitoring of story generation
    - Comprehensive error tracking
    - Enhanced debugging capabilities
+
+## Additional Patterns
+
+### Error Recovery Strategies
+The system implements multiple recovery strategies:
+- **Retry**: Exponential backoff with circuit breaker
+- **Skip**: Bypass non-critical failures
+- **Rollback**: Restore previous valid state
+- **Circuit Break**: Isolate failing components
+- **Manual Intervention**: Escalate to human review
+
+### Memory Management
+The memory system uses a hierarchical approach:
+1. **In-memory Store**: For long-term context and scene memory
+2. **Text Embeddings**: For similarity search and retrieval
+3. **Cache Layer**: With TTL-based expiration (1-hour for world generation, 30-min for character profiles)
+4. **Database Storage**: For persistent canonical data
+
+### Task Management
+- **Scene Processing**: Configurable concurrency levels for scene generation
+- **Circuit Breakers**: Prevent resource exhaustion
+- **Rate Limiting**: Token bucket algorithm for event processing
+- **Connection Pooling**: Efficient database connection reuse
+
+### Performance Optimization
+- **Caching Strategy**: Optimized for expensive operations
+- **Resource Constraints**: Configurable limits for agent operations
+- **Memory Management**: Session isolation and state cleanup
+- **Load Distribution**: Efficient task distribution across agents

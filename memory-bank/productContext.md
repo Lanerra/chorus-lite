@@ -34,3 +34,22 @@ Chorus-Lite provides a structured, autonomous writing workflow through:
 2. **Context Window Limits**: Story length constrained by LLM context window
 3. **Database Size**: Large stories require sufficient database storage
 4. **Model Selection**: Different LLM models affect writing style and quality
+
+## Key Technical Features
+- **Three-Agent Architecture**: 
+  - **StoryArchitect**: Develops high-level plot and outline, generates world-building elements
+  - **SceneGenerator**: Creates detailed scene content from briefs, performs revisions
+  - **IntegrationManager**: Integrates scenes into chapters, validates story structure
+- **LangGraph Orchestration**: Modular subgraphs for workflow management with error recovery
+- **PostgreSQL with pgvector**: Canonical storage with vector search capabilities
+- **Real-time Monitoring**: WebSocket-based live updates and logging
+- **Structured Output**: Pydantic models for data validation throughout
+- **Async-First**: All I/O operations use async/await pattern
+
+## Implementation Details
+The system follows a layered architecture:
+1. **Interface Layer**: FastAPI endpoints with WebSocket streaming
+2. **Orchestration Layer**: LangGraph workflow management with state tracking
+3. **Agent Layer**: Three specialized agents with clear responsibilities
+4. **Persistence Layer**: PostgreSQL with pgvector for canonical storage
+5. **Core Layer**: Shared utilities and infrastructure

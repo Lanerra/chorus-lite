@@ -1,52 +1,103 @@
-# **Tech Context: Chorus-Lite**
+# Chorus-Lite Technical Context
 
-## **Technologies Used**
-- **Programming Language**: Python 3.10+
-- **Database**: PostgreSQL with pgvector extension (for vector search)
-- **Orchestration**: LangGraph (stateful workflow management)
-- **ORM**: SQLAlchemy with Alembic for database migrations
-- **Web Framework**: FastAPI (based on `src/chorus/web/main.py` structure)
-- **Build System**: Poetry (dependency management)
-- **Containerization**: Docker (via `docker-compose.yml`)
+## Core Technologies
+- **Python 3.12+**: Primary development language
+- **PostgreSQL 1+**: Primary database with pgvector extension
+- **FastAPI**: Web framework for API and web interface
+- **LangGraph**: Workflow orchestration framework
+- **Poetry**: Dependency management
+- **Docker**: For local PostgreSQL setup
+- **Ruff**: Code formatting and linting
+- **Mypy**: Static type checking
 
-## **Development Setup**
-1. **Environment Initialization**:
-   - Install dependencies: `poetry install`
-   - Initialize database: `python scripts/init_db.py`
-   - Start development server: `uvicorn src/chorus.web.main:app --reload`
+## Development Setup
+```bash
+# Environment setup
+cp .env.example .env
+# Edit .env with appropriate values
+poetry install
+poetry shell
+```
 
-2. **Key Configuration Files**:
-   - `pyproject.toml`: Project dependencies and build settings
-   - `config/agents.yaml`: Agent configuration parameters
-   - `alembic.ini`: Database migration configuration
-   - `.env.example`: Environment variable template
+## Configuration Management
+Configuration uses Pydantic models with environment variables:
+```python
+class ChorusConfig(BaseModel):
+    database: DatabaseConfig
+    llm: LLMConfig
+    embedding: EmbeddingConfig
+    agents: AgentModelConfig
+    system: SystemConfig
+```
 
-## **Technical Constraints**
-- **Database Schema**: Must support PostgreSQL extensions (pgvector)
-- **Agent Communication**: Strictly via LangGraph state transitions
-- **State Persistence**: Full story state stored in database after each agent step
-- **Web Interface**: Real-time updates via WebSocket (`src/chorus/web/websocket.py`)
+## Key Technical Constraints
+1. **Async-First Architecture**: All I/O operations use async/await
+2. **Structured Output**: Pydantic models for data validation throughout
+3. **State Management**: LangGraph workflow state managed through TypedDict
+4. **Database Schema**: PostgreSQL with custom enum types and UUID primary keys
+5. **Error Handling**: Comprehensive error recovery strategies (retry, skip, rollback)
 
-## **Dependencies**
-- Core: `langgraph`, `sqlalchemy`, `psycopg2-binary`, `uvicorn`, `fastapi`
-- Database: `pgvector`, `alembic`
-- Utilities: `python-dotenv`, `python-jose`, `pydantic-settings`
+## Memory Management
+- **In-Memory Store**: For scene memory and context
+- **Text Embeddings**: For similarity search and memory retrieval
+- **Caching Strategy**: 
+  - World Generation: 1-hour TTL
+  - Character Profiles: 30-minute TTL
+  - Scene Memory: In-memory storage
 
-## **Tool Usage Patterns**
-- **Database Migrations**: `alembic upgrade head` (after schema changes)
-- **Development Workflow**: 
-  ```bash
-  poetry shell
-  uvicorn src/chorus.web.main:app --reload
-  ```
-- **Agent Configuration**: Modify `config/agents.yaml` for agent parameters
-- **Web Interface**: Access via `http://localhost:8000` (default FastAPI port)
+## Performance Considerations
+- **Task Concurrency**: Configurable scene processing concurrency
+- **Circuit Breakers**: Prevent resource exhaustion
+- **Rate Limiting**: Token bucket algorithm for event processing
+- **Connection Pooling**: Efficient database connection reuse
 
-## **Critical Integration Points**
-1. **LangGraph ↔ Canonical Database**:
-   - All agents query `src/chorus/canon/` before generating content
-   - Changes trigger coherence validation in `src/chorus/canon/db.py`
+## Security Measures
+- **API Key Management**: Environment variables for LLM API keys
+- **Input Validation**: Pydantic model validation for all inputs
+- **SQL Injection Prevention**: Parameterized queries
+- **XSS Protection**: Sanitized user input
+- **HTTPS Support**: TLS encryption for web interface
 
-2. **Web Interface ↔ Agents**:
-   - WebSocket updates sent via `src/chorus/web/websocket.py`
-   - Real-time logs visible in browser UI
+## Testing Strategy
+- **Unit Tests**: Individual component testing in `tests/`
+- **Integration Tests**: Multi-component workflow validation
+- **Performance Tests**: Load and stress testing
+- **Web Tests**: UI and API endpoint validation
+
+## Development Workflow
+1. **Feature Branches**: Isolated development work
+2. **Conventional Commits**: Standardized commit messages
+3. **Pull Requests**: Code review process
+4. **Squash Merging**: Clean commit history
+5. **CI Pipeline**: Automated testing and quality checks
+
+## Tooling
+- **Ruff**: For code formatting (`poetry run ruff check src`)
+- **Mypy**: For type checking (`poetry run mypy src`)
+- **Poetry**: Dependency management
+- **Alembic**: Database migrations
+- **Docker**: Local PostgreSQL setup for development
+
+## Configuration Variables
+| Variable | Purpose | Example |
+|----------|---------|---------|
+| `DATABASE_URL` | PostgreSQL connection string | `postgresql://user:password@localhost:5432/chorus` |
+| `OPENAI_API_BASE` | LLM API endpoint | `https://api.openai.com/v1` |
+| `STORY_ARCHITECT_MODEL` | Story architect LLM model | `gpt-4-turbo` |
+| `SCENE_GENERATOR_MODEL` | Scene generator LLM model | `gpt-4-turbo` |
+| `LOG_LEVEL` | Logging verbosity | `INFO` |
+| `TEMPERATURE` | LLM sampling temperature | `0.7` |
+
+## Critical Dependencies
+- **pgvector**: For vector search and embeddings
+- **LangGraph**: For workflow orchestration
+- **FastAPI**: For web interface and API
+- **Pydantic**: For data validation
+- **SQLAlchemy**: For database operations
+
+## Error Handling Strategy
+- **Retry with Exponential Backoff**: Automatic retries for transient errors
+- **Circuit Breaker Pattern**: Prevent cascading failures
+- **Fault Isolation**: Isolate failing components
+- **State Rollback**: Restore to previous valid state
+- **Manual Intervention**: Escalate to human review for critical errors

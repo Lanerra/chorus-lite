@@ -12,4 +12,4 @@ A lightweight version of the autonomous, agentic, creative-writing system.
 2. Run the application: `poetry run chorus`
 
 ## License
-MIT
+AGPLv3

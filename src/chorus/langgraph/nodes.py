@@ -29,7 +29,7 @@ from chorus.canon.postgres import (
     get_pg,
     update_scene_status,
 )
-from chorus.core.logs import get_logger, log_message
+from chorus.core.logs import get_event_logger, get_logger, log_message, EventType, LogLevel, Priority
 from chorus.models import (
     CharacterProfile,
     Concept,
@@ -43,6 +43,7 @@ from .memory import search_text, store_text, summarize_text
 from .state import SceneState, StoryState
 
 logger = get_logger(__name__)
+event_logger = get_event_logger()
 
 SCENE_FIELDS = {
     "draft",
@@ -437,20 +438,62 @@ async def _is_scene_approved(scene_id: str) -> bool:
 
 async def generate_concepts_node(state: StoryState) -> dict[str, Any]:
     """Return a list of story concepts for ``state.idea``."""
+    event_logger.log(
+        LogLevel.INFO,
+        f"Starting concept generation for idea: '{state.get('idea', 'Unknown')[:100]}'",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.HIGH,
+        metadata={"node": "generate_concepts_node", "operation": "start"}
+    )
+    
     model = _require_model("STORY_ARCHITECT_MODEL")
     architect = StoryArchitect(model=model)
     concepts = await architect.generate_concepts(cast(str, state["idea"]))
+    
+    event_logger.log(
+        LogLevel.INFO,
+        f"Successfully generated {len(concepts)} concepts",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.HIGH,
+        metadata={"node": "generate_concepts_node", "operation": "complete", "concepts_count": len(concepts)}
+    )
+    
     return {"concepts": concepts}
 
 
 async def select_concept_node(state: StoryState) -> dict[str, Any]:
     """Return the first concept as the chosen concept."""
+    event_logger.log(
+        LogLevel.INFO,
+        "Starting concept selection",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.HIGH,
+        metadata={"node": "select_concept_node", "operation": "start"}
+    )
+    
     concepts = cast(list[Concept], state["concepts"])
     
     # Return the first concept without evaluation
     if not concepts:
+        event_logger.log(
+            LogLevel.ERROR,
+            "No concepts available for selection",
+            event_type=EventType.LANGGRAPH_NODE,
+            priority=Priority.HIGH,
+            metadata={"node": "select_concept_node", "error": "no_concepts"}
+        )
         raise ValueError("No concepts to choose from.")
-    return {"vision": concepts[0], "concept_rejected": False}
+    
+    selected_concept = concepts[0]
+    event_logger.log(
+        LogLevel.INFO,
+        f"Selected concept: '{selected_concept.title}'",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.HIGH,
+        metadata={"node": "select_concept_node", "operation": "complete", "selected_concept": selected_concept.title}
+    )
+    
+    return {"vision": selected_concept, "concept_rejected": False}
 
 
 async def generate_world(state: StoryState) -> dict[str, Any]:
@@ -458,21 +501,63 @@ async def generate_world(state: StoryState) -> dict[str, Any]:
 
     Side-effects: none (in-memory only). Sets 'world_generated'=True for ordering.
     """
-    await ensure_schema()
-    model = _require_model("STORY_ARCHITECT_MODEL")
     concept = cast(Concept, state["vision"])
+    event_logger.log(
+        LogLevel.INFO,
+        f"Starting world generation for concept: '{concept.title}'",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.HIGH,
+        metadata={"node": "generate_world", "operation": "start", "concept_title": concept.title}
+    )
+    
+    event_logger.log(
+        LogLevel.DEBUG,
+        "Ensuring database schema for world generation",
+        event_type=EventType.DATABASE_OPERATION,
+        priority=Priority.NORMAL,
+        metadata={"node": "generate_world", "operation": "ensure_schema"}
+    )
+    await ensure_schema()
+    
+    model = _require_model("STORY_ARCHITECT_MODEL")
     architect = StoryArchitect(model=model)
     world = await architect.generate_world_anvil(concept)
+    
+    event_logger.log(
+        LogLevel.INFO,
+        f"Successfully generated world with {len(world)} elements",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.HIGH,
+        metadata={"node": "generate_world", "operation": "complete", "world_elements": len(world)}
+    )
+    
     return {"world_info": world, "world_generated": True}
 
 
 async def generate_profiles(state: StoryState) -> dict[str, Any]:
     """Generate character profiles for the concept."""
+    concept = cast(Concept, state["vision"])
+    event_logger.log(
+        LogLevel.INFO,
+        f"Starting character profile generation for concept: '{concept.title}'",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.HIGH,
+        metadata={"node": "generate_profiles", "operation": "start", "concept_title": concept.title}
+    )
+    
     await ensure_schema()
     model = _require_model("STORY_ARCHITECT_MODEL")
-    concept = cast(Concept, state["vision"])
     architect = StoryArchitect(model=model)
     profiles = await architect.generate_profiles(concept)
+    
+    event_logger.log(
+        LogLevel.INFO,
+        f"Successfully generated {len(profiles)} character profiles",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.HIGH,
+        metadata={"node": "generate_profiles", "operation": "complete", "profiles_count": len(profiles)}
+    )
+    
     return {"character_profiles": profiles}
 
 
@@ -529,12 +614,27 @@ async def generate_outline(state: StoryState) -> dict[str, Any]:
     # Guard ordering: require narrative seed
     narrative_ready = state.get("seeded")
     if not narrative_ready:
-        log_message("generate_outline: skipping; prerequisite 'seeded' not satisfied")
+        event_logger.log(
+            LogLevel.WARNING,
+            "generate_outline: skipping; prerequisite 'seeded' not satisfied",
+            event_type=EventType.LANGGRAPH_NODE,
+            priority=Priority.NORMAL,
+            metadata={"node": "generate_outline", "operation": "skip", "reason": "prerequisite_not_met"}
+        )
         return {}
-    await ensure_schema()
-    model = _require_model("STORY_ARCHITECT_MODEL")
+    
     concept = cast(Concept, state["vision"])
     profiles = cast(list[CharacterProfile], state.get("character_profiles", []))
+    event_logger.log(
+        LogLevel.INFO,
+        f"Starting outline generation for concept: '{concept.title}' with {len(profiles)} characters",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.HIGH,
+        metadata={"node": "generate_outline", "operation": "start", "concept_title": concept.title, "profiles_count": len(profiles)}
+    )
+    
+    await ensure_schema()
+    model = _require_model("STORY_ARCHITECT_MODEL")
     architect = StoryArchitect(model=model)
 
     # Create outline and convert to tasks
@@ -548,6 +648,20 @@ async def generate_outline(state: StoryState) -> dict[str, Any]:
         briefs.extend(chapter.scenes)
         persisted_chapters.append(chapter.title)
     queue = [str(b.id) for b in briefs if b.id is not None]
+
+    event_logger.log(
+        LogLevel.INFO,
+        f"Successfully generated outline with {len(chapters)} chapters and {len(briefs)} scenes",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.HIGH,
+        metadata={
+            "node": "generate_outline",
+            "operation": "complete",
+            "chapters_count": len(chapters),
+            "scenes_count": len(briefs),
+            "queue_size": len(queue)
+        }
+    )
 
     # Return both the original outline struct and the persisted story/chapters/queue
     return {
@@ -604,10 +718,26 @@ async def generate_scenes(state: StoryState) -> dict[str, Any]:
 
 async def dequeue_scene(state: StoryState) -> dict[str, Any]:
     """Pop the next scene ID from ``scene_queue``."""
-
     queue = list(state.get("scene_queue", []))
+    
+    event_logger.log(
+        LogLevel.DEBUG,
+        f"Dequeuing scene from queue of {len(queue)} scenes",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.NORMAL,
+        metadata={"node": "dequeue_scene", "operation": "start", "queue_size": len(queue)}
+    )
+    
     if not queue:
+        event_logger.log(
+            LogLevel.INFO,
+            "Scene queue is empty, no more scenes to process",
+            event_type=EventType.LANGGRAPH_NODE,
+            priority=Priority.NORMAL,
+            metadata={"node": "dequeue_scene", "operation": "complete", "current_scene_id": None}
+        )
         return {"current_scene_id": None}
+    
     current = queue.pop(0)
     # Track processed scene ids to avoid reprocessing when refilling
     from collections.abc import Iterable
@@ -615,6 +745,21 @@ async def dequeue_scene(state: StoryState) -> dict[str, Any]:
 
     processed = set(_cast(Iterable[str], state.get("processed_scene_ids", [])))
     processed.add(str(current))
+    
+    event_logger.log(
+        LogLevel.INFO,
+        f"Dequeued scene {current}, {len(queue)} scenes remaining",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.HIGH,
+        metadata={
+            "node": "dequeue_scene",
+            "operation": "complete",
+            "current_scene_id": current,
+            "remaining_queue_size": len(queue),
+            "processed_count": len(processed)
+        }
+    )
+    
     return {
         "scene_queue": queue,
         "current_scene_id": current,
@@ -644,9 +789,37 @@ async def draft_scene(state: StoryState) -> dict[str, Any]:
         joined = "; ".join(", ".join(c) for c in cast(list[list[str]], clusters))
         context["character_clusters"] = joined
 
+    event_logger.log(
+        LogLevel.INFO,
+        f"Starting scene draft generation for scene {brief.id}: '{brief.title}'",
+        event_type=EventType.SCENE_DRAFT,
+        priority=Priority.HIGH,
+        scene_id=str(brief.id) if brief.id else None,
+        metadata={
+            "node": "draft_scene",
+            "operation": "start",
+            "model": model,
+            "scene_title": brief.title,
+            "has_context": bool(context)
+        }
+    )
     scene_generator = SceneGenerator(model=model)
     scene = await scene_generator.write_scene(
         brief, context=context if context else None
+    )
+    event_logger.log(
+        LogLevel.INFO,
+        f"Scene draft generated for scene {brief.id}: '{brief.title}' ({len(scene.text)} characters)",
+        event_type=EventType.SCENE_DRAFT,
+        priority=Priority.HIGH,
+        scene_id=str(brief.id) if brief.id else None,
+        metadata={
+            "node": "draft_scene",
+            "operation": "complete",
+            "draft_length": len(scene.text),
+            "scene_title": brief.title,
+            "scene_status": scene.status.value if scene.status else None
+        }
     )
 
     notes: str | None = None
@@ -790,16 +963,57 @@ async def coherence_check_node(state: StoryState) -> dict[str, Any]:
     issues = []
 
     # 1. Character consistency check
+    scene_id = str(brief.id) if brief.id else None
+    event_logger.log(
+        LogLevel.INFO,
+        f"Starting character consistency check for scene {scene_id}",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.NORMAL,
+        scene_id=scene_id,
+        metadata={"node": "coherence_check_node", "check_type": "character_consistency"}
+    )
     if brief.description and brief.characters:
         char_passed, char_issues = check_character_consistency(brief.description, draft)
         issues.extend(char_issues)
+    event_logger.log(
+        LogLevel.INFO,
+        f"Character consistency check completed with {len(char_issues)} issues",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.NORMAL,
+        scene_id=scene_id,
+        metadata={"node": "coherence_check_node", "issues_count": len(char_issues), "check_type": "character_consistency"}
+    )
 
     # 2. Basic readability check
+    event_logger.log(
+        LogLevel.INFO,
+        f"Starting basic readability check for scene {scene_id}",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.NORMAL,
+        scene_id=scene_id,
+        metadata={"node": "coherence_check_node", "check_type": "readability"}
+    )
     read_passed, read_issues = check_basic_readability(draft)
     issues.extend(read_issues)
+    event_logger.log(
+        LogLevel.INFO,
+        f"Readability check completed with {len(read_issues)} issues",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.NORMAL,
+        scene_id=scene_id,
+        metadata={"node": "coherence_check_node", "issues_count": len(read_issues), "check_type": "readability"}
+    )
 
     # Determine pass/fail
     coherence_passed = len(issues) == 0
+    event_logger.log(
+        LogLevel.INFO,
+        f"Coherence check completed for scene {scene_id}: {'passed' if coherence_passed else 'failed'}",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.HIGH,
+        scene_id=scene_id,
+        metadata={"node": "coherence_check_node", "operation": "complete", "coherence_passed": coherence_passed, "issues_count": len(issues)}
+    )
 
     if coherence_passed:
         await _set_scene_status(str(brief.id), SceneStatus.APPROVED)
@@ -827,9 +1041,16 @@ async def coherence_check_node(state: StoryState) -> dict[str, Any]:
 
 async def revise_scene(state: StoryState) -> dict[str, Any]:
     """Apply accumulated feedback and prepare for a new draft."""
-
-    model = _require_model("INTEGRATION_MANAGER_MODEL")
     brief = _current_brief(state)
+    event_logger.log(
+        LogLevel.INFO,
+        f"Starting scene revision for scene {brief.id}: '{brief.title}'",
+        event_type=EventType.SCENE_REVISION,
+        priority=Priority.HIGH,
+        scene_id=str(brief.id) if brief.id else None,
+        metadata={"node": "revise_scene", "operation": "start", "revision_count": state.get("revision_count", 0)}
+    )
+    model = _require_model("INTEGRATION_MANAGER_MODEL")
     if brief.id is None:
         raise ValueError("scene brief missing id")
     draft = cast(str, state.get("draft", ""))
@@ -898,6 +1119,14 @@ async def integrate(state: StoryState) -> dict[str, Any]:
         "revision_history": history,
         "draft_rejected": draft_rejected,
     }
+    event_logger.log(
+        LogLevel.INFO,
+        f"Scene revision completed for scene {brief.id}: '{brief.title}'",
+        event_type=EventType.SCENE_REVISION,
+        priority=Priority.HIGH,
+        scene_id=str(brief.id) if brief.id else None,
+        metadata={"node": "revise_scene", "operation": "complete", "new_draft_length": len(draft)}
+    )
     return _with_scene_state(state, output)
 
 
@@ -966,7 +1195,15 @@ async def catalog_lore_node(state: StoryState) -> dict[str, Any]:
     if not entries:
         return {}
 
-    logger.info(f"Cataloged {len(entries)} lore entries")
+    scene_id = state.get("current_scene_id")
+    event_logger.log(
+        LogLevel.INFO,
+        f"Cataloged {len(entries)} lore entries for scene {scene_id}",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.NORMAL,
+        scene_id=str(scene_id) if scene_id else None,
+        metadata={"node": "catalog_lore_node", "operation": "complete", "entries_count": len(entries)}
+    )
     return {"lore_discovered": entries}
 
 
@@ -1136,6 +1373,15 @@ async def refill_scene_queue_if_needed(state: StoryState) -> dict[str, Any]:
 
 async def human_feedback_node(state: StoryState) -> dict[str, Any]:
     """Collect user feedback or allow vision edits."""
+    scene_id = state.get("current_scene_id")
+    event_logger.log(
+        LogLevel.INFO,
+        f"Skipping user feedback collection in non-interactive mode for scene {scene_id}",
+        event_type=EventType.LANGGRAPH_NODE,
+        priority=Priority.NORMAL,
+        scene_id=str(scene_id) if scene_id else None,
+        metadata={"node": "human_feedback_node", "operation": "skip", "reason": "non_interactive_mode"}
+    )
 
     updates: dict[str, Any] = {}
     # Removed interactive mode - no user feedback in non-interactive mode

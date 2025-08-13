@@ -11,7 +11,7 @@ from sqlalchemy import text as sa_text
 from chorus.agents.base import Agent
 from chorus.canon.postgres import _maybe_await, get_pg
 from chorus.core.llm import call_llm_structured
-from chorus.core.logs import log_message
+from chorus.core.logs import get_event_logger, log_message, EventType, LogLevel, Priority
 from chorus.models import (
     Chapter,
     Scene,
@@ -39,6 +39,7 @@ class IntegrationManager(Agent):
             models.
         """
         super().__init__(model=model, default_model_env="INTEGRATION_MANAGER_MODEL")
+        self.event_logger = get_event_logger()
 
     # --- Story Integration Methods ---
 
@@ -48,6 +49,20 @@ class IntegrationManager(Agent):
         """Integrate a collection of scenes into a cohesive chapter."""
         if not scenes:
             raise ValueError("Cannot integrate empty scene list")
+
+        self.event_logger.log(
+            LogLevel.INFO,
+            f"Starting scene integration for {len(scenes)} scenes into chapter",
+            event_type=EventType.AGENT_OPERATION,
+            priority=Priority.HIGH,
+            metadata={
+                "agent": "IntegrationManager",
+                "operation": "integrate_scenes",
+                "scenes_count": len(scenes),
+                "scene_titles": [s.title for s in scenes],
+                "has_existing_chapter": chapter is not None
+            }
+        )
 
         # Sort scenes by their intended order
         sorted_scenes = sorted(scenes, key=lambda s: getattr(s, "order_index", 0))
@@ -75,6 +90,14 @@ class IntegrationManager(Agent):
             "Respond only with JSON that matches the Chapter schema. DO NOT include any commentary or additional text."
         )
 
+        self.event_logger.log(
+            LogLevel.DEBUG,
+            "Sending chapter integration request to LLM",
+            event_type=EventType.LLM_REQUEST,
+            priority=Priority.NORMAL,
+            metadata={"agent": "IntegrationManager", "model": self.model, "prompt_length": len(prompt)}
+        )
+
         integrated_chapter = await call_llm_structured(self.model, prompt, Chapter)
 
         # Preserve existing chapter metadata if provided
@@ -84,6 +107,19 @@ class IntegrationManager(Agent):
 
         # Link scenes to chapter
         integrated_chapter.scenes = sorted_scenes
+
+        self.event_logger.log(
+            LogLevel.INFO,
+            f"Successfully integrated chapter: '{integrated_chapter.title}' with {len(sorted_scenes)} scenes",
+            event_type=EventType.AGENT_OPERATION,
+            priority=Priority.HIGH,
+            metadata={
+                "agent": "IntegrationManager",
+                "operation": "integrate_scenes",
+                "chapter_title": integrated_chapter.title,
+                "integrated_scenes": len(sorted_scenes)
+            }
+        )
 
         return integrated_chapter
 
@@ -257,8 +293,18 @@ class IntegrationManager(Agent):
                         [f"{character}: {issue}" for issue in issues]
                     )
             except Exception as e:
-                await self.log_message(
-                    f"Error checking character consistency for {character}: {e}"
+                self.event_logger.log(
+                    LogLevel.ERROR,
+                    f"Error checking character consistency for {character}: {e}",
+                    event_type=EventType.AGENT_OPERATION,
+                    priority=Priority.NORMAL,
+                    metadata={
+                        "agent": "IntegrationManager",
+                        "operation": "check_consistency_across_chapters",
+                        "character_name": character,
+                        "error": str(e),
+                        "error_type": type(e).__name__
+                    }
                 )
 
         # Check timeline consistency
@@ -275,7 +321,18 @@ class IntegrationManager(Agent):
             if isinstance(issues, list):
                 consistency_issues["timeline_issues"] = issues
         except Exception as e:
-            await self.log_message(f"Error checking timeline consistency: {e}")
+            self.event_logger.log(
+                LogLevel.ERROR,
+                f"Error checking timeline consistency: {e}",
+                event_type=EventType.AGENT_OPERATION,
+                priority=Priority.NORMAL,
+                metadata={
+                    "agent": "IntegrationManager",
+                    "operation": "check_consistency_across_chapters",
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                }
+            )
 
         return consistency_issues
 
@@ -306,7 +363,18 @@ class IntegrationManager(Agent):
                             f"Chapter {chapter_idx + 1}, Scene {scene_idx + 1} to {scene_idx + 2}: {result}"
                         )
                 except Exception as e:
-                    await self.log_message(f"Error checking scene transition: {e}")
+                    self.event_logger.log(
+                        LogLevel.ERROR,
+                        f"Error checking scene transition: {e}",
+                        event_type=EventType.AGENT_OPERATION,
+                        priority=Priority.NORMAL,
+                        metadata={
+                            "agent": "IntegrationManager",
+                            "operation": "validate_scene_transitions",
+                            "error": str(e),
+                            "error_type": type(e).__name__
+                        }
+                    )
 
             # Check transition to next chapter
             if chapter_idx < len(story.chapters) - 1:
@@ -331,8 +399,17 @@ class IntegrationManager(Agent):
                                 f"Chapter {chapter_idx + 1} to {chapter_idx + 2}: {result}"
                             )
                     except Exception as e:
-                        await self.log_message(
-                            f"Error checking chapter transition: {e}"
+                        self.event_logger.log(
+                            LogLevel.ERROR,
+                            f"Error checking chapter transition: {e}",
+                            event_type=EventType.AGENT_OPERATION,
+                            priority=Priority.NORMAL,
+                            metadata={
+                                "agent": "IntegrationManager",
+                                "operation": "validate_scene_transitions",
+                                "error": str(e),
+                                "error_type": type(e).__name__
+                            }
                         )
 
         return transition_issues
@@ -433,7 +510,13 @@ class IntegrationManager(Agent):
 
     async def log_message(self, message: str) -> None:
         """Log a message using the logging system."""
-        await log_message(message)
+        self.event_logger.log(
+            LogLevel.INFO,
+            message,
+            event_type=EventType.AGENT_OPERATION,
+            priority=Priority.NORMAL,
+            metadata={"agent": "IntegrationManager"}
+        )
 
     async def call_llm(self, prompt: str) -> str:
         """Call the LLM with a simple prompt and return text response."""

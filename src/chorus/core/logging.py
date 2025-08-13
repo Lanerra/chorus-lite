@@ -56,6 +56,41 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(data, ensure_ascii=False)
 
 
+class EnhancedFormatter(logging.Formatter):
+    """Enhanced formatter with better visual hierarchy and context."""
+    
+    def __init__(self):
+        # Use a more detailed format with better structure
+        super().__init__(
+            fmt="%(asctime)s | %(levelname)8s | %(name)s | %(message)s",
+            datefmt="%H:%M:%S"
+        )
+    
+    def format(self, record: logging.LogRecord) -> str:
+        # Add visual indicators for different log levels
+        if record.levelno >= logging.CRITICAL:
+            record.levelname = f"🚨 {record.levelname}"
+        elif record.levelno >= logging.ERROR:
+            record.levelname = f"❌ {record.levelname}"
+        elif record.levelno >= logging.WARNING:
+            record.levelname = f"⚠️  {record.levelname}"
+        elif record.levelno <= logging.DEBUG:
+            record.levelname = f"🔍 {record.levelname}"
+        else:  # INFO
+            record.levelname = f"ℹ️  {record.levelname}"
+        
+        # Simplify logger names for readability
+        if record.name.startswith("chorus."):
+            record.name = record.name[7:]  # Remove "chorus." prefix
+        
+        formatted = super().format(record)
+        
+        # Reset the level name to avoid affecting other handlers
+        record.levelname = record.levelname.split()[-1] if " " in record.levelname else record.levelname
+        
+        return formatted
+
+
 def _str_to_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
@@ -143,21 +178,15 @@ def init_logging(
             formatter = logging.Formatter("%(message)s")
             handler.setFormatter(formatter)
         except Exception:
-            # Fallback to plain
+            # Fallback to enhanced plain formatter
             handler = logging.StreamHandler(sys.stdout)
             handler.setLevel(log_level)
-            formatter = logging.Formatter(
-                fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-                datefmt="%H:%M:%S",
-            )
+            formatter = EnhancedFormatter()
             handler.setFormatter(formatter)
     else:
         handler = logging.StreamHandler(sys.stdout)
         handler.setLevel(log_level)
-        formatter = logging.Formatter(
-            fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-            datefmt="%H:%M:%S",
-        )
+        formatter = EnhancedFormatter()
         handler.setFormatter(formatter)
 
     root.addHandler(handler)

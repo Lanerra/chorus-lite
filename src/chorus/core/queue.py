@@ -17,7 +17,7 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.exc import SQLAlchemyError
 
 from chorus.config import config
-from chorus.core.logs import log_calls, log_message
+from chorus.core.logs import log_calls, log_message, get_event_logger, EventType, LogLevel, Priority
 from chorus.models.task import BaseTask
 
 # Status values mirrored from docs/schemas/TaskQueue.json / SQL model
@@ -36,6 +36,7 @@ class ParallelTaskProcessor:
         self.worker_semaphore = asyncio.Semaphore(self.max_workers)
         self.active_workers = 0
         self.processed_count = 0
+        self.event_logger = get_event_logger()
 
     async def dequeue_parallel(self, count: int = None) -> list[BaseTask]:
         """Dequeue multiple tasks for parallel processing."""
@@ -64,14 +65,49 @@ class ParallelTaskProcessor:
             async with self.worker_semaphore:
                 self.active_workers += 1
                 try:
-                    log_message(
-                        f"Worker processing task {task.id} (active workers: {self.active_workers})"
+                    self.event_logger.log(
+                        LogLevel.DEBUG,
+                        f"Worker processing task {task.id} (active workers: {self.active_workers})",
+                        event_type=EventType.TASK_PROCESSING,
+                        priority=Priority.NORMAL,
+                        metadata={
+                            "task_id": str(task.id),
+                            "task_type": task.task_type,
+                            "active_workers": self.active_workers,
+                            "operation": "task_start"
+                        }
                     )
                     success = await handler_func(task)
                     self.processed_count += 1
+                    
+                    self.event_logger.log(
+                        LogLevel.INFO,
+                        f"Task {task.id} completed successfully",
+                        event_type=EventType.TASK_PROCESSING,
+                        priority=Priority.NORMAL,
+                        metadata={
+                            "task_id": str(task.id),
+                            "task_type": task.task_type,
+                            "operation": "task_complete",
+                            "success": True
+                        }
+                    )
                     return task, success
                 except Exception as e:
-                    log_message(f"Task {task.id} failed: {e}")
+                    self.event_logger.log(
+                        LogLevel.ERROR,
+                        f"Task {task.id} failed: {e}",
+                        event_type=EventType.TASK_PROCESSING,
+                        priority=Priority.HIGH,
+                        metadata={
+                            "task_id": str(task.id),
+                            "task_type": task.task_type,
+                            "operation": "task_error",
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                            "success": False
+                        }
+                    )
                     return task, False
                 finally:
                     self.active_workers -= 1
@@ -85,15 +121,34 @@ class ParallelTaskProcessor:
         processed_results = []
         for result in results:
             if isinstance(result, Exception):
-                log_message(f"Task processing exception: {result}")
+                self.event_logger.log(
+                    LogLevel.ERROR,
+                    f"Task processing exception: {result}",
+                    event_type=EventType.TASK_PROCESSING,
+                    priority=Priority.HIGH,
+                    metadata={
+                        "operation": "parallel_processing_exception",
+                        "error": str(result),
+                        "error_type": type(result).__name__
+                    }
+                )
                 # Create a failure result for the exception
                 processed_results.append((None, False))
             else:
                 processed_results.append(result)
 
         success_count = sum(1 for _, success in processed_results if success)
-        log_message(
-            f"Parallel processing completed: {success_count}/{len(tasks)} tasks successful"
+        self.event_logger.log(
+            LogLevel.INFO,
+            f"Parallel processing completed: {success_count}/{len(tasks)} tasks successful",
+            event_type=EventType.TASK_PROCESSING,
+            priority=Priority.HIGH,
+            metadata={
+                "operation": "parallel_processing_complete",
+                "total_tasks": len(tasks),
+                "successful_tasks": success_count,
+                "failed_tasks": len(tasks) - success_count
+            }
         )
 
         return processed_results
@@ -138,7 +193,22 @@ async def enqueue(task: BaseTask, *, priority: int = 1) -> UUID:
     # Defer import to avoid circulars
     from chorus.canon import get_pg
 
+    event_logger = get_event_logger()
     task_type, payload = _serialize_task(task)
+    
+    event_logger.log(
+        LogLevel.DEBUG,
+        f"Enqueueing task {task.id} of type {task_type}",
+        event_type=EventType.DATABASE_OPERATION,
+        priority=Priority.NORMAL,
+        metadata={
+            "task_id": str(task.id) if task.id else None,
+            "task_type": task_type,
+            "priority": priority,
+            "operation": "enqueue_start"
+        }
+    )
+    
     try:
         async with get_pg() as conn:
             # Bind JSON via driver-native bindparam so SQLAlchemy renders ($1, $2, ...) for psycopg
@@ -178,13 +248,41 @@ async def enqueue(task: BaseTask, *, priority: int = 1) -> UUID:
             db_id: UUID = row[0]
             task.id = db_id
             await conn.commit()
-            log_message(f"Enqueued {task.task_type} {db_id}")
+            
+            event_logger.log(
+                LogLevel.INFO,
+                f"Successfully enqueued {task.task_type} with ID {db_id}",
+                event_type=EventType.DATABASE_OPERATION,
+                priority=Priority.NORMAL,
+                metadata={
+                    "task_id": str(db_id),
+                    "task_type": task.task_type,
+                    "priority": priority,
+                    "operation": "enqueue_success"
+                }
+            )
             return db_id
+            
     except SQLAlchemyError as exc:
         # Fallback: still assign an id to avoid upstream None checks, but log error.
         if task.id is None:
             task.id = uuid4()
-        log_message(f"Failed to enqueue task to DB: {exc}")
+            
+        event_logger.log(
+            LogLevel.ERROR,
+            f"Failed to enqueue task to database: {exc}",
+            event_type=EventType.DATABASE_OPERATION,
+            priority=Priority.HIGH,
+            metadata={
+                "task_id": str(task.id),
+                "task_type": task.task_type,
+                "priority": priority,
+                "operation": "enqueue_error",
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "fallback_id_generated": True
+            }
+        )
         return cast(UUID, task.id)
 
 
@@ -195,6 +293,16 @@ async def dequeue() -> BaseTask | None:
     Uses SKIP LOCKED to allow multiple workers.
     """
     from chorus.canon import get_pg
+
+    event_logger = get_event_logger()
+    
+    event_logger.log(
+        LogLevel.DEBUG,
+        "Starting task dequeue operation",
+        event_type=EventType.DATABASE_OPERATION,
+        priority=Priority.NORMAL,
+        metadata={"operation": "dequeue_start"}
+    )
 
     try:
         async with get_pg() as conn:
@@ -232,9 +340,32 @@ async def dequeue() -> BaseTask | None:
 
             task = _deserialize_task(_Row(row[0], row[1], row[2]))
             await conn.commit()
+            
+            event_logger.log(
+                LogLevel.INFO,
+                f"Successfully dequeued task {task.id} of type {task.task_type}",
+                event_type=EventType.DATABASE_OPERATION,
+                priority=Priority.NORMAL,
+                metadata={
+                    "task_id": str(task.id),
+                    "task_type": task.task_type,
+                    "operation": "dequeue_success"
+                }
+            )
             return task
+            
     except SQLAlchemyError as exc:
-        log_message(f"Dequeue error: {exc}")
+        event_logger.log(
+            LogLevel.ERROR,
+            f"Database error during dequeue operation: {exc}",
+            event_type=EventType.DATABASE_OPERATION,
+            priority=Priority.HIGH,
+            metadata={
+                "operation": "dequeue_error",
+                "error": str(exc),
+                "error_type": type(exc).__name__
+            }
+        )
         return None
 
 
@@ -287,10 +418,36 @@ async def dequeue_batch(limit: int = 5) -> list[BaseTask]:
 
             tasks = [_deserialize_task(_Row(row[0], row[1], row[2])) for row in rows]
             await conn.commit()
-            log_message(f"Batch dequeued {len(tasks)} tasks for parallel processing")
+            
+            event_logger = get_event_logger()
+            event_logger.log(
+                LogLevel.INFO,
+                f"Batch dequeued {len(tasks)} tasks for parallel processing",
+                event_type=EventType.DATABASE_OPERATION,
+                priority=Priority.NORMAL,
+                metadata={
+                    "operation": "batch_dequeue_success",
+                    "tasks_count": len(tasks),
+                    "requested_limit": limit,
+                    "task_types": [task.task_type for task in tasks]
+                }
+            )
             return tasks
+            
     except SQLAlchemyError as exc:
-        log_message(f"Batch dequeue error: {exc}")
+        event_logger = get_event_logger()
+        event_logger.log(
+            LogLevel.ERROR,
+            f"Database error during batch dequeue operation: {exc}",
+            event_type=EventType.DATABASE_OPERATION,
+            priority=Priority.HIGH,
+            metadata={
+                "operation": "batch_dequeue_error",
+                "requested_limit": limit,
+                "error": str(exc),
+                "error_type": type(exc).__name__
+            }
+        )
         return []
 
 
@@ -319,8 +476,20 @@ async def list_tasks() -> list[BaseTask]:
                         self.payload = payload or {}
 
                 tasks.append(_deserialize_task(_Row(id_, type_, payload)))
+                
     except SQLAlchemyError as exc:
-        log_message(f"list_tasks error: {exc}")
+        event_logger = get_event_logger()
+        event_logger.log(
+            LogLevel.ERROR,
+            f"Database error while listing tasks: {exc}",
+            event_type=EventType.DATABASE_OPERATION,
+            priority=Priority.NORMAL,
+            metadata={
+                "operation": "list_tasks_error",
+                "error": str(exc),
+                "error_type": type(exc).__name__
+            }
+        )
     return tasks
 
 
@@ -338,9 +507,35 @@ async def move_to_dlq(task: BaseTask) -> None:
                 {"dlq": STATUS_DLQ, "id": task.id},
             )
             await conn.commit()
-            log_message(f"DLQ {task.task_type} {task.id}")
+            
+            event_logger = get_event_logger()
+            event_logger.log(
+                LogLevel.WARNING,
+                f"Moved task {task.id} of type {task.task_type} to dead letter queue",
+                event_type=EventType.DATABASE_OPERATION,
+                priority=Priority.HIGH,
+                metadata={
+                    "task_id": str(task.id),
+                    "task_type": task.task_type,
+                    "operation": "move_to_dlq_success"
+                }
+            )
+            
     except SQLAlchemyError as exc:
-        log_message(f"move_to_dlq error: {exc}")
+        event_logger = get_event_logger()
+        event_logger.log(
+            LogLevel.ERROR,
+            f"Database error while moving task {task.id} to DLQ: {exc}",
+            event_type=EventType.DATABASE_OPERATION,
+            priority=Priority.HIGH,
+            metadata={
+                "task_id": str(task.id) if task.id else None,
+                "task_type": task.task_type,
+                "operation": "move_to_dlq_error",
+                "error": str(exc),
+                "error_type": type(exc).__name__
+            }
+        )
 
 
 async def list_dlq() -> list[BaseTask]:
@@ -368,8 +563,20 @@ async def list_dlq() -> list[BaseTask]:
                         self.payload = payload or {}
 
                 tasks.append(_deserialize_task(_Row(id_, type_, payload)))
+                
     except SQLAlchemyError as exc:
-        log_message(f"list_dlq error: {exc}")
+        event_logger = get_event_logger()
+        event_logger.log(
+            LogLevel.ERROR,
+            f"Database error while listing DLQ tasks: {exc}",
+            event_type=EventType.DATABASE_OPERATION,
+            priority=Priority.NORMAL,
+            metadata={
+                "operation": "list_dlq_error",
+                "error": str(exc),
+                "error_type": type(exc).__name__
+            }
+        )
     return tasks
 
 
@@ -384,8 +591,34 @@ async def delete_dlq(task_id: UUID) -> None:
                 sa_text("DELETE FROM task_queue WHERE id = :id AND status = :dlq"),
                 {"id": task_id, "dlq": STATUS_DLQ},
             )
+            await conn.commit()
+            
+            event_logger = get_event_logger()
+            event_logger.log(
+                LogLevel.INFO,
+                f"Permanently deleted DLQ task {task_id}",
+                event_type=EventType.DATABASE_OPERATION,
+                priority=Priority.NORMAL,
+                metadata={
+                    "task_id": str(task_id),
+                    "operation": "delete_dlq_success"
+                }
+            )
+            
     except SQLAlchemyError as exc:
-        log_message(f"delete_dlq error: {exc}")
+        event_logger = get_event_logger()
+        event_logger.log(
+            LogLevel.ERROR,
+            f"Database error while deleting DLQ task {task_id}: {exc}",
+            event_type=EventType.DATABASE_OPERATION,
+            priority=Priority.HIGH,
+            metadata={
+                "task_id": str(task_id),
+                "operation": "delete_dlq_error",
+                "error": str(exc),
+                "error_type": type(exc).__name__
+            }
+        )
 
 
 @log_calls
@@ -407,8 +640,35 @@ async def requeue_dlq(task_id: UUID, *, priority: int = 1) -> None:
                 },
             )
             await conn.commit()
+            
+            event_logger = get_event_logger()
+            event_logger.log(
+                LogLevel.INFO,
+                f"Successfully requeued DLQ task {task_id} with priority {priority}",
+                event_type=EventType.DATABASE_OPERATION,
+                priority=Priority.NORMAL,
+                metadata={
+                    "task_id": str(task_id),
+                    "new_priority": priority,
+                    "operation": "requeue_dlq_success"
+                }
+            )
+            
     except SQLAlchemyError as exc:
-        log_message(f"requeue_dlq error: {exc}")
+        event_logger = get_event_logger()
+        event_logger.log(
+            LogLevel.ERROR,
+            f"Database error while requeuing DLQ task {task_id}: {exc}",
+            event_type=EventType.DATABASE_OPERATION,
+            priority=Priority.HIGH,
+            metadata={
+                "task_id": str(task_id),
+                "priority": priority,
+                "operation": "requeue_dlq_error",
+                "error": str(exc),
+                "error_type": type(exc).__name__
+            }
+        )
 
 
 @log_calls
@@ -425,9 +685,33 @@ async def mark_complete(task_id: UUID | None) -> None:
                 {"completed": STATUS_COMPLETED, "id": task_id},
             )
             await conn.commit()
-            log_message(f"Completed {task_id}")
+            
+            event_logger = get_event_logger()
+            event_logger.log(
+                LogLevel.INFO,
+                f"Successfully marked task {task_id} as completed",
+                event_type=EventType.DATABASE_OPERATION,
+                priority=Priority.NORMAL,
+                metadata={
+                    "task_id": str(task_id),
+                    "operation": "mark_complete_success"
+                }
+            )
+            
     except SQLAlchemyError as exc:
-        log_message(f"mark_complete error: {exc}")
+        event_logger = get_event_logger()
+        event_logger.log(
+            LogLevel.ERROR,
+            f"Database error while marking task {task_id} as complete: {exc}",
+            event_type=EventType.DATABASE_OPERATION,
+            priority=Priority.HIGH,
+            metadata={
+                "task_id": str(task_id) if task_id else None,
+                "operation": "mark_complete_error",
+                "error": str(exc),
+                "error_type": type(exc).__name__
+            }
+        )
 
 
 @log_calls

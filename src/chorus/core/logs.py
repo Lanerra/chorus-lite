@@ -50,12 +50,27 @@ class EventType(Enum):
     WORKFLOW_ERROR = "workflow_error"
     WORKFLOW_NODE = "workflow_node"
 
+    # LangGraph specific events
+    LANGGRAPH_NODE = "langgraph_node"
+
     # Scene generation events
     SCENE_GENERATION = "scene_generation"
     SCENE_DRAFT = "scene_draft"
     SCENE_REVIEW = "scene_review"
     SCENE_REVISION = "scene_revision"
     SCENE_FINALIZED = "scene_finalized"
+
+    # LLM interaction events
+    LLM_REQUEST = "llm_request"
+    
+    # Database operation events
+    DATABASE_OPERATION = "database_operation"
+    
+    # Agent operation events
+    AGENT_OPERATION = "agent_operation"
+    
+    # Task processing events
+    TASK_PROCESSING = "task_processing"
 
     # User interaction events
     USER_ACTION = "user_action"
@@ -452,7 +467,7 @@ class EventLogger:
         self._background_tasks_started = False
 
     def _configure_traditional_logger(self) -> None:
-        """Configure traditional logging system."""
+        """Configure traditional logging system with enhanced formatting."""
         # Remove existing handlers
         for handler in list(self._traditional_logger.handlers):
             self._traditional_logger.removeHandler(handler)
@@ -461,26 +476,33 @@ class EventLogger:
         level = os.getenv("LOG_LEVEL", "INFO").upper()
         self._traditional_logger.setLevel(level)
 
-        # Create custom formatter
-        formatter = logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        # Create enhanced formatter for better visibility
+        enhanced_formatter = logging.Formatter(
+            "%(asctime)s | %(levelname)8s | %(name)s | %(message)s",
+            datefmt="%H:%M:%S"
+        )
+        
+        # Create simple formatter for file output (no emojis in files)
+        file_formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
         )
 
-        # Console handler
+        # Console handler with enhanced formatting
         console_handler = logging.StreamHandler()
-        console_handler.setFormatter(formatter)
+        console_handler.setFormatter(enhanced_formatter)
         self._traditional_logger.addHandler(console_handler)
 
-        # File handler
+        # File handler with simple formatting
         root = Path(__file__).resolve().parents[2]
         log_file = Path(os.getenv("CHORUS_LOG_FILE", root / "chorus_log.txt"))
         file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(formatter)
+        file_handler.setFormatter(file_formatter)
         self._traditional_logger.addHandler(file_handler)
 
         # Add custom handler for structured logging
         structured_handler = StructuredLogHandler(self)
-        structured_handler.setFormatter(formatter)
+        structured_handler.setFormatter(enhanced_formatter)
         self._traditional_logger.addHandler(structured_handler)
 
     def _get_websocket_manager(self) -> WebSocketManager | None:
@@ -605,13 +627,32 @@ class EventLogger:
                 self._traditional_logger.error("Error in metrics loop: %s", e)
                 await asyncio.sleep(5)
 
+    def _handle_task_exception(self, task: asyncio.Task) -> None:
+        """Handle exceptions from fire-and-forget tasks."""
+        try:
+            exception = task.exception()
+            if exception is not None:
+                # Use basic logging to avoid recursion
+                import logging
+                fallback_logger = logging.getLogger("chorus.logs.fallback")
+                fallback_logger.error(f"Task exception in logging: {exception}")
+        except Exception:
+            # Ignore errors in error handling to prevent infinite recursion
+            pass
+
     async def log_event(self, event: StructuredLogEvent) -> None:
         """Log a structured event with rate limiting and routing.
 
         Args:
             event: Structured log event to log
         """
-        await self._log_event_internal(event)
+        try:
+            await self._log_event_internal(event)
+        except Exception as e:
+            # Fallback to traditional logging to avoid recursion
+            import logging
+            fallback_logger = logging.getLogger("chorus.logs.fallback")
+            fallback_logger.error(f"Failed to log structured event: {e}")
 
     async def _log_event_internal(
         self,
@@ -651,10 +692,16 @@ class EventLogger:
 
         # Log to traditional logger for file/console output (unless bypassing)
         if not bypass_traditional:
-            self._log_to_traditional(event)
+            try:
+                self._log_to_traditional(event)
+            except Exception as e:
+                # Use basic logging to avoid recursion
+                import logging
+                fallback_logger = logging.getLogger("chorus.logs.fallback")
+                fallback_logger.error(f"Failed to log to traditional logger: {e}")
 
     def _log_to_traditional(self, event: StructuredLogEvent) -> None:
-        """Log event to traditional logging system."""
+        """Log event to traditional logging system with enhanced formatting."""
         log_level = {
             LogLevel.DEBUG: logging.DEBUG,
             LogLevel.INFO: logging.INFO,
@@ -663,23 +710,140 @@ class EventLogger:
             LogLevel.CRITICAL: logging.CRITICAL,
         }.get(event.level, logging.INFO)
 
-        # Format message with context
-        context_parts = []
-        if event.session_id:
-            context_parts.append(f"session={event.session_id[:8]}")
-        if event.thread_id:
-            context_parts.append(f"thread={event.thread_id[:8]}")
-        if event.component:
-            context_parts.append(f"component={event.component}")
-        if event.workflow_node:
-            context_parts.append(f"node={event.workflow_node}")
-        if event.scene_id:
-            context_parts.append(f"scene={event.scene_id}")
-
-        context_str = f"[{', '.join(context_parts)}] " if context_parts else ""
-        formatted_message = f"[{event.event_type.value}] {context_str}{event.message}"
+        # Enhanced formatting with better visual hierarchy
+        event_type_display = self._format_event_type(event.event_type, event.level)
+        context_display = self._format_context(event)
+        priority_display = self._format_priority(event.priority)
+        
+        # Performance metrics display
+        timing_display = ""
+        if event.processing_time_ms or event.queue_time_ms:
+            timing_parts = []
+            if event.processing_time_ms:
+                timing_parts.append(f"proc:{event.processing_time_ms:.1f}ms")
+            if event.queue_time_ms:
+                timing_parts.append(f"queue:{event.queue_time_ms:.1f}ms")
+            timing_display = f" [{'/'.join(timing_parts)}]"
+        
+        # Enhanced metadata display for key operations
+        metadata_display = self._format_key_metadata(event)
+        
+        # Construct final formatted message with better structure
+        message_parts = [event_type_display]
+        if priority_display:
+            message_parts.append(priority_display)
+        if context_display:
+            message_parts.append(context_display)
+        if metadata_display:
+            message_parts.append(metadata_display)
+        
+        header = " ".join(message_parts)
+        formatted_message = f"{header} ➤ {event.message}{timing_display}"
+        
+        # Special formatting for errors and critical events
+        if event.level in (LogLevel.ERROR, LogLevel.CRITICAL):
+            formatted_message = f"🚨 {formatted_message}"
+        elif event.level == LogLevel.WARNING:
+            formatted_message = f"⚠️  {formatted_message}"
+        elif event.event_type in (EventType.WORKFLOW_START, EventType.WORKFLOW_COMPLETE):
+            formatted_message = f"🔄 {formatted_message}"
+        elif event.event_type in (EventType.LLM_REQUEST, EventType.SCENE_GENERATION):
+            formatted_message = f"🤖 {formatted_message}"
+        elif event.event_type in (EventType.DATABASE_OPERATION,):
+            formatted_message = f"💾 {formatted_message}"
 
         self._traditional_logger.log(log_level, formatted_message)
+    
+    def _format_event_type(self, event_type: EventType, level: LogLevel) -> str:
+        """Format event type with visual indicators."""
+        # Handle case where event_type is not an EventType enum (defensive programming)
+        if isinstance(event_type, EventType):
+            type_name = event_type.value.upper()
+        elif isinstance(event_type, int):
+            # Handle integer values (likely LogLevel values passed incorrectly)
+            try:
+                # Try to find EventType by value
+                event_type = EventType.SYSTEM  # Default fallback
+                type_name = "SYSTEM"
+            except (ValueError, AttributeError):
+                type_name = f"UNKNOWN_{event_type}"
+        elif hasattr(event_type, 'value'):
+            # Handle other enum types
+            type_name = str(event_type.value).upper()
+        else:
+            # Last resort: convert to string
+            type_name = str(event_type).upper()
+        
+        # Color coding for different event types (when using Rich)
+        if level in (LogLevel.ERROR, LogLevel.CRITICAL):
+            return f"[ERROR:{type_name}]"
+        elif level == LogLevel.WARNING:
+            return f"[WARN:{type_name}]"
+        elif isinstance(event_type, EventType) and event_type in (EventType.WORKFLOW_START, EventType.WORKFLOW_COMPLETE, EventType.LANGGRAPH_NODE):
+            return f"[FLOW:{type_name}]"
+        elif isinstance(event_type, EventType) and event_type == EventType.LLM_REQUEST:
+            return f"[LLM:{type_name}]"
+        elif isinstance(event_type, EventType) and event_type == EventType.DATABASE_OPERATION:
+            return f"[DB:{type_name}]"
+        elif isinstance(event_type, EventType) and event_type in (EventType.SCENE_GENERATION, EventType.SCENE_DRAFT):
+            return f"[SCENE:{type_name}]"
+        else:
+            return f"[{type_name}]"
+    
+    def _format_context(self, event: StructuredLogEvent) -> str:
+        """Format context with improved readability."""
+        context_parts = []
+        
+        # Priority order: scene_id, workflow_node, component, session_id, thread_id
+        if event.scene_id:
+            context_parts.append(f"scene:{event.scene_id}")
+        if event.workflow_node:
+            context_parts.append(f"node:{event.workflow_node}")
+        if event.component:
+            # Simplify component names for readability
+            component = event.component.replace("chorus.", "").replace("src.", "")
+            context_parts.append(f"comp:{component}")
+        if event.session_id:
+            context_parts.append(f"sess:{event.session_id[:8]}")
+        if event.thread_id:
+            context_parts.append(f"thread:{event.thread_id[:8]}")
+        
+        return f"({' | '.join(context_parts)})" if context_parts else ""
+    
+    def _format_priority(self, priority: Priority) -> str:
+        """Format priority with visual indicators."""
+        if priority == Priority.CRITICAL:
+            return "[🔴CRIT]"
+        elif priority == Priority.HIGH:
+            return "[🟡HIGH]"
+        elif priority == Priority.LOW:
+            return "[🔵LOW]"
+        else:
+            return ""  # Normal priority doesn't need display
+    
+    def _format_key_metadata(self, event: StructuredLogEvent) -> str:
+        """Format key metadata for better visibility."""
+        if not event.metadata:
+            return ""
+        
+        key_info = []
+        
+        # Show key operational data
+        if "operation" in event.metadata:
+            key_info.append(f"op:{event.metadata['operation']}")
+        if "model" in event.metadata:
+            key_info.append(f"model:{event.metadata['model']}")
+        if "duration" in event.metadata:
+            duration = event.metadata["duration"]
+            if isinstance(duration, (int, float)):
+                key_info.append(f"dur:{duration:.2f}s")
+        if "attempt" in event.metadata and "max_attempts" in event.metadata:
+            key_info.append(f"attempt:{event.metadata['attempt']}/{event.metadata['max_attempts']}")
+        if "success" in event.metadata:
+            success_icon = "✅" if event.metadata["success"] else "❌"
+            key_info.append(f"{success_icon}")
+        
+        return f"<{' | '.join(key_info)}>" if key_info else ""
 
     def log(
         self,
@@ -727,12 +891,20 @@ class EventLogger:
         # Ensure background tasks are started
         self._start_background_tasks()
 
-        # Use fire-and-forget for non-blocking logging
+        # Use fire-and-forget for non-blocking logging with proper error handling
         try:
-            asyncio.create_task(self.log_event(event))
+            task = asyncio.create_task(self.log_event(event))
+            # Add error callback to prevent "Task exception was never retrieved"
+            task.add_done_callback(self._handle_task_exception)
         except RuntimeError:
             # No event loop, run synchronously
-            asyncio.run(self.log_event(event))
+            try:
+                asyncio.run(self.log_event(event))
+            except Exception as e:
+                # Fallback to traditional logging
+                import logging
+                fallback_logger = logging.getLogger("chorus.logs.fallback")
+                fallback_logger.error(f"Failed to log event: {e}")
 
     # Convenience methods for different log levels
     def debug(self, message: str, **kwargs: Any) -> None:

@@ -18,7 +18,7 @@ from chorus.canon.postgres import (
     get_pg,
 )
 from chorus.core.llm import call_llm_structured
-from chorus.core.logs import log_message
+from chorus.core.logs import get_event_logger, log_message, EventType, LogLevel, Priority
 from chorus.core.queue import enqueue
 from chorus.models import (
     CharacterProfile,
@@ -74,6 +74,7 @@ class SceneGenerator(Agent):
             models.
         """
         super().__init__(model=model, default_model_env="SCENE_GENERATOR_MODEL")
+        self.event_logger = get_event_logger()
 
     # --- Scene Writing Methods ---
 
@@ -81,9 +82,33 @@ class SceneGenerator(Agent):
         self, brief: SceneBrief, context: dict[str, Any] | None = None
     ) -> Scene:
         """Generate scene content from a brief with optional context."""
+        self.event_logger.log(
+            LogLevel.INFO,
+            f"Starting scene writing for: '{brief.title}'",
+            event_type=EventType.SCENE_DRAFT,
+            priority=Priority.HIGH,
+            scene_id=brief.id,
+            metadata={
+                "agent": "SceneGenerator",
+                "operation": "write_scene",
+                "scene_title": brief.title,
+                "characters": brief.characters or [],
+                "has_context": context is not None,
+                "context_keys": list(context.keys()) if context else []
+            }
+        )
+        
         context_str = ""
         if context:
             context_str = f"\nContext: {json.dumps(context, indent=2)}"
+            self.event_logger.log(
+                LogLevel.DEBUG,
+                f"Using context for scene generation: {list(context.keys())}",
+                event_type=EventType.SCENE_DRAFT,
+                priority=Priority.NORMAL,
+                scene_id=brief.id,
+                metadata={"agent": "SceneGenerator", "context_size": len(str(context))}
+            )
 
         prompt = (
             "Write a compelling scene based on this brief. "
@@ -94,6 +119,15 @@ class SceneGenerator(Agent):
             "Respond only with JSON that matches the Scene schema. DO NOT include any commentary or additional text."
         )
 
+        self.event_logger.log(
+            LogLevel.DEBUG,
+            "Sending scene generation request to LLM",
+            event_type=EventType.LLM_REQUEST,
+            priority=Priority.NORMAL,
+            scene_id=brief.id,
+            metadata={"agent": "SceneGenerator", "model": self.model, "prompt_length": len(prompt)}
+        )
+
         scene = await call_llm_structured(self.model, prompt, Scene)
 
         # Copy essential fields from brief
@@ -102,6 +136,20 @@ class SceneGenerator(Agent):
         scene.description = brief.description
         scene.characters = brief.characters or []
         scene.status = SceneStatus.DRAFT
+
+        self.event_logger.log(
+            LogLevel.INFO,
+            f"Successfully generated scene draft: '{scene.title}' ({len(scene.text or '')} characters)",
+            event_type=EventType.SCENE_DRAFT,
+            priority=Priority.HIGH,
+            scene_id=brief.id,
+            metadata={
+                "agent": "SceneGenerator",
+                "operation": "write_scene",
+                "scene_text_length": len(scene.text or ''),
+                "scene_status": scene.status.value
+            }
+        )
 
         return scene
 
@@ -199,8 +247,18 @@ class SceneGenerator(Agent):
                     if isinstance(issues, list) and issues:
                         character_issues[profile.name] = issues
                 except Exception as e:
-                    await self.log_message(
-                        f"Error checking character consistency for {profile.name}: {e}"
+                    self.event_logger.log(
+                        LogLevel.ERROR,
+                        f"Error checking character consistency for {profile.name}: {e}",
+                        event_type=EventType.AGENT_OPERATION,
+                        priority=Priority.NORMAL,
+                        metadata={
+                            "agent": "SceneGenerator",
+                            "operation": "validate_character_consistency",
+                            "character_name": profile.name,
+                            "error": str(e),
+                            "error_type": type(e).__name__
+                        }
                     )
 
         return character_issues
@@ -255,7 +313,14 @@ class SceneGenerator(Agent):
     async def check_scene(self, scene: Scene) -> Scene | None:
         """Validate ``scene`` against the Canon."""
 
-        await self.log_message(f"Continuity check for scene {scene.id}")
+        self.event_logger.log(
+            LogLevel.INFO,
+            f"Starting continuity check for scene {scene.id}",
+            event_type=EventType.SCENE_CONTINUITY,
+            priority=Priority.HIGH,
+            scene_id=scene.id,
+            metadata={"agent": "SceneGenerator", "operation": "check_scene"}
+        )
         async with self.get_db_connection() as conn:
             # Check if we should skip continuity check for first chapter
             order_cursor = await conn.execute(
@@ -269,8 +334,13 @@ class SceneGenerator(Agent):
             chapter_index = row[0] if row else None
 
             if chapter_index == 1:
-                await self.log_message(
-                    f"Skipping continuity check for first chapter scene {scene.id}"
+                self.event_logger.log(
+                    LogLevel.INFO,
+                    f"Skipping continuity check for first chapter scene {scene.id} (chapter 1 scenes bypass continuity)",
+                    event_type=EventType.SCENE_CONTINUITY,
+                    priority=Priority.NORMAL,
+                    scene_id=scene.id,
+                    metadata={"agent": "SceneGenerator", "chapter_index": chapter_index}
                 )
                 status = SceneStatus.DRAFTING
                 await conn.execute(
@@ -279,7 +349,14 @@ class SceneGenerator(Agent):
                 )
                 await conn.commit()
                 scene.status = status
-                await self.log_message(f"Continuity check passed for scene {scene.id}")
+                self.event_logger.log(
+                    LogLevel.INFO,
+                    f"Continuity check passed for scene {scene.id} (first chapter approval)",
+                    event_type=EventType.SCENE_CONTINUITY,
+                    priority=Priority.HIGH,
+                    scene_id=scene.id,
+                    metadata={"agent": "SceneGenerator", "operation": "check_scene", "result": "approved"}
+                )
                 return scene
 
         # Check for continuity issues using database logic (similar to checks.py)
@@ -289,8 +366,19 @@ class SceneGenerator(Agent):
 
         if issues:
             status = SceneStatus.REJECTED
-            await self.log_message(
-                f"Continuity check failed for scene {scene.id}: {feedback}"
+            self.event_logger.log(
+                LogLevel.WARNING,
+                f"Continuity check failed for scene {scene.id}, enqueuing for rewrite",
+                event_type=EventType.SCENE_CONTINUITY,
+                priority=Priority.HIGH,
+                scene_id=scene.id,
+                metadata={
+                    "agent": "SceneGenerator",
+                    "operation": "check_scene",
+                    "result": "rejected",
+                    "feedback": feedback,
+                    "issues_count": len(issues)
+                }
             )
             await enqueue(
                 RewriteTask(
@@ -316,11 +404,25 @@ class SceneGenerator(Agent):
                     content=feedback,
                 ),
             )
-            await self.log_message(f"Continuity check failed for scene {scene.id}")
+            self.event_logger.log(
+                LogLevel.ERROR,
+                f"Continuity check failed for scene {scene.id} - creating story feedback entry",
+                event_type=EventType.SCENE_CONTINUITY,
+                priority=Priority.HIGH,
+                scene_id=scene.id,
+                metadata={"agent": "SceneGenerator", "operation": "check_scene", "result": "failed"}
+            )
             return None
 
         scene.status = status
-        await self.log_message(f"Continuity check passed for scene {scene.id}")
+        self.event_logger.log(
+            LogLevel.INFO,
+            f"Continuity check passed for scene {scene.id}",
+            event_type=EventType.SCENE_CONTINUITY,
+            priority=Priority.HIGH,
+            scene_id=scene.id,
+            metadata={"agent": "SceneGenerator", "operation": "check_scene", "result": "approved"}
+        )
         return scene
 
     async def _check_continuity_db(self, scene: Scene) -> list[ContinuityFeedback]:
@@ -486,8 +588,18 @@ class SceneGenerator(Agent):
         successful_scenes = []
         for i, result in enumerate(scenes):
             if isinstance(result, Exception):
-                await self.log_message(
-                    f"Error processing scene {briefs[i].title}: {result}"
+                self.event_logger.log(
+                    LogLevel.ERROR,
+                    f"Error processing scene '{briefs[i].title}' in batch: {result}",
+                    event_type=EventType.SCENE_DRAFT,
+                    priority=Priority.HIGH,
+                    metadata={
+                        "agent": "SceneGenerator",
+                        "operation": "batch_process_scenes",
+                        "scene_title": briefs[i].title,
+                        "error": str(result),
+                        "error_type": type(result).__name__
+                    }
                 )
             else:
                 successful_scenes.append(result)
@@ -498,7 +610,13 @@ class SceneGenerator(Agent):
 
     async def log_message(self, message: str) -> None:
         """Log a message using the logging system."""
-        await log_message(message)
+        self.event_logger.log(
+            LogLevel.INFO,
+            message,
+            event_type=EventType.AGENT_OPERATION,
+            priority=Priority.NORMAL,
+            metadata={"agent": "SceneGenerator"}
+        )
 
     async def call_llm(self, prompt: str) -> str:
         """Call the LLM with a simple prompt and return text response."""

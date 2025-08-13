@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -22,7 +23,10 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.sql import func, select
 
 from chorus.config import config
-from chorus.core.logs import log_message
+from chorus.core.logs import log_message, get_event_logger, EventType, Priority
+
+# Initialize EventLogger for database session management
+event_logger = get_event_logger()
 
 DATABASE_URL = config.database.postgres_url
 
@@ -43,10 +47,55 @@ async def _maybe_await(value: Any) -> Any:
 @asynccontextmanager
 async def get_pg() -> AsyncIterator[AsyncSession]:
     """Return a SQLAlchemy asynchronous session."""
+    
+    start_time = time.time()
+    await event_logger.log(
+        EventType.DATABASE_OPERATION,
+        "Creating PostgreSQL session",
+        Priority.NORMAL,
+        metadata={"operation": "session_create", "database": "postgres"}
+    )
+    
     try:
         async with SessionLocal() as session:
+            creation_time = time.time() - start_time
+            await event_logger.log(
+                EventType.DATABASE_OPERATION,
+                "PostgreSQL session created successfully",
+                Priority.NORMAL,
+                metadata={
+                    "operation": "session_create",
+                    "database": "postgres",
+                    "creation_time": creation_time,
+                    "success": True
+                }
+            )
             yield session
+            
+            total_time = time.time() - start_time
+            await event_logger.log(
+                EventType.DATABASE_OPERATION,
+                "PostgreSQL session completed",
+                Priority.NORMAL,
+                metadata={
+                    "operation": "session_complete",
+                    "database": "postgres",
+                    "total_duration": total_time
+                }
+            )
     except SQLAlchemyError as exc:  # pragma: no cover - connection errors
+        duration = time.time() - start_time
+        await event_logger.log_error_handling_start(
+            error_type=type(exc).__name__,
+            error_msg=str(exc),
+            context="PostgreSQL session creation",
+            metadata={
+                "operation": "session_create",
+                "database": "postgres",
+                "duration": duration,
+                "error_category": "connection"
+            }
+        )
         log_message(f"PostgreSQL connection error: {exc}")
         raise
 
@@ -58,18 +107,74 @@ async def advisory_lock(session: AsyncSession, lock_id: int) -> AsyncIterator[No
     Uses explicit bigint casts to avoid psycopg/SQLAlchemy binding as NUMERIC.
     """
 
+    start_time = time.time()
+    await event_logger.log(
+        EventType.DATABASE_OPERATION,
+        f"Acquiring PostgreSQL advisory lock: {lock_id}",
+        Priority.NORMAL,
+        metadata={"operation": "advisory_lock_acquire", "lock_id": lock_id}
+    )
+
     # Use typed bindparam (BIGINT) to satisfy pg_advisory_lock signature with psycopg3
     stmt_lock = select(func.pg_advisory_lock(bindparam("id", type_=BigInteger))).params(
         id=int(lock_id)
     )
-    await session.execute(stmt_lock)
+    
     try:
-        yield
-    finally:
-        stmt_unlock = select(
-            func.pg_advisory_unlock(bindparam("id", type_=BigInteger))
-        ).params(id=int(lock_id))
-        await session.execute(stmt_unlock)
+        await session.execute(stmt_lock)
+        lock_time = time.time() - start_time
+        await event_logger.log(
+            EventType.DATABASE_OPERATION,
+            f"Successfully acquired advisory lock: {lock_id}",
+            Priority.NORMAL,
+            metadata={
+                "operation": "advisory_lock_acquire",
+                "lock_id": lock_id,
+                "lock_time": lock_time,
+                "success": True
+            }
+        )
+        
+        try:
+            yield
+        finally:
+            await event_logger.log(
+                EventType.DATABASE_OPERATION,
+                f"Releasing PostgreSQL advisory lock: {lock_id}",
+                Priority.NORMAL,
+                metadata={"operation": "advisory_lock_release", "lock_id": lock_id}
+            )
+            
+            stmt_unlock = select(
+                func.pg_advisory_unlock(bindparam("id", type_=BigInteger))
+            ).params(id=int(lock_id))
+            await session.execute(stmt_unlock)
+            
+            total_time = time.time() - start_time
+            await event_logger.log(
+                EventType.DATABASE_OPERATION,
+                f"Successfully released advisory lock: {lock_id}",
+                Priority.NORMAL,
+                metadata={
+                    "operation": "advisory_lock_release",
+                    "lock_id": lock_id,
+                    "total_duration": total_time,
+                    "success": True
+                }
+            )
+    except Exception as e:
+        duration = time.time() - start_time
+        await event_logger.log_error_handling_start(
+            error_type=type(e).__name__,
+            error_msg=str(e),
+            context=f"Advisory lock operations for lock_id {lock_id}",
+            metadata={
+                "operation": "advisory_lock",
+                "lock_id": lock_id,
+                "duration": duration
+            }
+        )
+        raise
 
 
 async def ensure_schema() -> None:
@@ -79,45 +184,164 @@ async def ensure_schema() -> None:
     (e.g., Uvicorn reloaders, multiple nodes). Uses a session-level advisory
     lock and stamps baseline if DB is empty before upgrading to heads.
     """
+    start_time = time.time()
+    await event_logger.log(
+        EventType.DATABASE_OPERATION,
+        "Starting database schema initialization",
+        Priority.HIGH,
+        metadata={"operation": "schema_ensure", "phase": "start"}
+    )
+    
     # Use a stable advisory lock id (signed 64-bit). Hash of 'chorus_schema_lock'.
     # Truncate to 63 bits to ensure it fits into BIGINT and retains sign safety.
     _RAW_LOCK_ID = 0x43686F7275735F534348454D41
     LOCK_ID = int(_RAW_LOCK_ID & 0x7FFF_FFFF_FFFF_FFFF)
 
-    async with get_pg() as session:
-        # Acquire advisory lock to serialize schema setup across processes
-        stmt_lock = select(
-            func.pg_advisory_lock(bindparam("id", type_=BigInteger))
-        ).params(id=LOCK_ID)
-        await session.execute(stmt_lock)
-        try:
-            # If any admin table exists, assume migrations have been applied sufficiently.
-            result = await session.execute(
-                sa_text("SELECT to_regclass('public.alembic_version')")
+    try:
+        async with get_pg() as session:
+            await event_logger.log(
+                EventType.DATABASE_OPERATION,
+                f"Acquiring schema lock: {LOCK_ID}",
+                Priority.HIGH,
+                metadata={"operation": "schema_ensure", "phase": "lock_acquire", "lock_id": LOCK_ID}
             )
-            alembic_present = await _maybe_await(result.scalar())
-
-            # If alembic_version is missing, stamp baseline then upgrade heads
-            root = Path(__file__).resolve().parents[3]
-            cfg = Config(str(root / "alembic.ini"))
-
-            if alembic_present is None:
-                # Stamp the initial baseline revision without running it repeatedly
-                alembic_command.stamp(cfg, "20250805_baseline")  # type: ignore[attr-defined]
-
-            # Now upgrade to latest heads exactly once
-            alembic_command.upgrade(cfg, "heads")  # type: ignore[attr-defined]
-        finally:
-            # Always release the lock
-            stmt_unlock = select(
-                func.pg_advisory_unlock(bindparam("id", type_=BigInteger))
+            
+            # Acquire advisory lock to serialize schema setup across processes
+            stmt_lock = select(
+                func.pg_advisory_lock(bindparam("id", type_=BigInteger))
             ).params(id=LOCK_ID)
-            await session.execute(stmt_unlock)
+            await session.execute(stmt_lock)
+            
+            try:
+                await event_logger.log(
+                    EventType.DATABASE_OPERATION,
+                    "Checking for existing alembic version table",
+                    Priority.HIGH,
+                    metadata={"operation": "schema_ensure", "phase": "check_alembic"}
+                )
+                
+                # If any admin table exists, assume migrations have been applied sufficiently.
+                result = await session.execute(
+                    sa_text("SELECT to_regclass('public.alembic_version')")
+                )
+                alembic_present = await _maybe_await(result.scalar())
+
+                # If alembic_version is missing, stamp baseline then upgrade heads
+                root = Path(__file__).resolve().parents[3]
+                cfg = Config(str(root / "alembic.ini"))
+
+                if alembic_present is None:
+                    await event_logger.log(
+                        EventType.DATABASE_OPERATION,
+                        "Alembic version table not found, stamping baseline",
+                        Priority.HIGH,
+                        metadata={"operation": "schema_ensure", "phase": "stamp_baseline", "revision": "20250805_baseline"}
+                    )
+                    # Stamp the initial baseline revision without running it repeatedly
+                    alembic_command.stamp(cfg, "20250805_baseline")  # type: ignore[attr-defined]
+                else:
+                    await event_logger.log(
+                        EventType.DATABASE_OPERATION,
+                        "Alembic version table found, skipping baseline stamp",
+                        Priority.HIGH,
+                        metadata={"operation": "schema_ensure", "phase": "baseline_exists"}
+                    )
+
+                await event_logger.log(
+                    EventType.DATABASE_OPERATION,
+                    "Upgrading database to latest heads",
+                    Priority.HIGH,
+                    metadata={"operation": "schema_ensure", "phase": "upgrade_heads"}
+                )
+                
+                # Now upgrade to latest heads exactly once
+                alembic_command.upgrade(cfg, "heads")  # type: ignore[attr-defined]
+                
+                await event_logger.log(
+                    EventType.DATABASE_OPERATION,
+                    "Database schema upgrade completed successfully",
+                    Priority.HIGH,
+                    metadata={"operation": "schema_ensure", "phase": "upgrade_complete"}
+                )
+                
+            finally:
+                # Always release the lock
+                await event_logger.log(
+                    EventType.DATABASE_OPERATION,
+                    f"Releasing schema lock: {LOCK_ID}",
+                    Priority.HIGH,
+                    metadata={"operation": "schema_ensure", "phase": "lock_release", "lock_id": LOCK_ID}
+                )
+                
+                stmt_unlock = select(
+                    func.pg_advisory_unlock(bindparam("id", type_=BigInteger))
+                ).params(id=LOCK_ID)
+                await session.execute(stmt_unlock)
+        
+        duration = time.time() - start_time
+        await event_logger.log(
+            EventType.DATABASE_OPERATION,
+            f"Schema initialization completed successfully in {duration:.2f}s",
+            Priority.HIGH,
+            metadata={
+                "operation": "schema_ensure",
+                "phase": "complete",
+                "duration": duration,
+                "success": True
+            }
+        )
+        
+    except Exception as e:
+        duration = time.time() - start_time
+        await event_logger.log_error_handling_start(
+            error_type=type(e).__name__,
+            error_msg=str(e),
+            context="Database schema initialization",
+            metadata={
+                "operation": "schema_ensure",
+                "duration": duration,
+                "lock_id": LOCK_ID
+            }
+        )
+        raise
 
 
 async def commit_session(session: AsyncSession) -> None:
     """Explicitly commit the transaction on a connection."""
-    await session.commit()
+    
+    start_time = time.time()
+    await event_logger.log(
+        EventType.DATABASE_OPERATION,
+        "Committing database session",
+        Priority.NORMAL,
+        metadata={"operation": "session_commit"}
+    )
+    
+    try:
+        await session.commit()
+        duration = time.time() - start_time
+        await event_logger.log(
+            EventType.DATABASE_OPERATION,
+            f"Session committed successfully in {duration:.3f}s",
+            Priority.NORMAL,
+            metadata={
+                "operation": "session_commit",
+                "duration": duration,
+                "success": True
+            }
+        )
+    except Exception as e:
+        duration = time.time() - start_time
+        await event_logger.log_error_handling_start(
+            error_type=type(e).__name__,
+            error_msg=str(e),
+            context="Database session commit",
+            metadata={
+                "operation": "session_commit",
+                "duration": duration
+            }
+        )
+        raise
 
 
 __all__ = [

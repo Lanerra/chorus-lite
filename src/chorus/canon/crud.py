@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 from uuid import UUID
+import time
 
 import yaml
 from psycopg.types.json import Jsonb
@@ -14,6 +15,7 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from chorus.canon.db import _maybe_await
+from chorus.core.logs import get_event_logger, EventType, Priority
 from chorus.models import (
     ApprovalLog,
     Chapter,
@@ -31,37 +33,108 @@ from chorus.models import (
 
 from .queries import store_scene_text_conn
 
+# Initialize EventLogger for database operations
+event_logger = get_event_logger()
+
 
 async def set_configuration_conn(session: AsyncSession, key: str, value: Any) -> None:
     """Insert or update configuration ``key`` to ``value`` using ``session``."""
-
-    await session.execute(
-        sa_text(
-            "INSERT INTO configuration (key, value) VALUES (:key, :val) "
-            "ON CONFLICT (key) DO UPDATE SET value = :val, updated_at = NOW()"
-        ),
-        {"key": key, "val": Jsonb(value)},
+    
+    start_time = time.time()
+    await event_logger.log(
+        EventType.DATABASE_OPERATION,
+        f"Setting configuration key: {key}",
+        Priority.NORMAL,
+        metadata={"operation": "upsert", "table": "configuration", "key": key, "value_type": type(value).__name__}
     )
+
+    try:
+        await session.execute(
+            sa_text(
+                "INSERT INTO configuration (key, value) VALUES (:key, :val) "
+                "ON CONFLICT (key) DO UPDATE SET value = :val, updated_at = NOW()"
+            ),
+            {"key": key, "val": Jsonb(value)},
+        )
+        
+        duration = time.time() - start_time
+        await event_logger.log(
+            EventType.DATABASE_OPERATION,
+            f"Successfully set configuration {key}",
+            Priority.NORMAL,
+            metadata={"operation": "upsert", "table": "configuration", "duration": duration, "success": True}
+        )
+    except Exception as e:
+        duration = time.time() - start_time
+        await event_logger.log_error_handling_start(
+            error_type=type(e).__name__,
+            error_msg=str(e),
+            context=f"Setting configuration {key}",
+            metadata={"operation": "upsert", "table": "configuration", "duration": duration, "key": key}
+        )
+        raise
 
 
 async def set_configuration(key: str, value: Any) -> None:
     """Insert or update configuration ``key`` with ``value``."""
+
+    await event_logger.log(
+        EventType.DATABASE_OPERATION,
+        f"Setting configuration with new session: {key}",
+        Priority.NORMAL,
+        metadata={"operation": "set_configuration", "key": key, "session_management": True}
+    )
 
     from chorus.canon.db import get_pg
 
     async with get_pg() as session:
         await set_configuration_conn(session, key, value)
         await session.commit()
+        
+        await event_logger.log(
+            EventType.DATABASE_OPERATION,
+            f"Configuration {key} committed successfully",
+            Priority.NORMAL,
+            metadata={"operation": "set_configuration", "key": key, "committed": True}
+        )
 
 
 async def get_configuration(session: AsyncSession, key: str) -> Any | None:
     """Return configuration value for ``key``."""
 
-    result = await session.execute(
-        sa_text("SELECT value FROM configuration WHERE key = :key"), {"key": key}
+    start_time = time.time()
+    await event_logger.log(
+        EventType.DATABASE_OPERATION,
+        f"Retrieving configuration for key: {key}",
+        Priority.NORMAL,
+        metadata={"operation": "select", "table": "configuration", "key": key}
     )
-    row = await _maybe_await(result.fetchone())
-    return row[0] if row else None
+
+    try:
+        result = await session.execute(
+            sa_text("SELECT value FROM configuration WHERE key = :key"), {"key": key}
+        )
+        row = await _maybe_await(result.fetchone())
+        
+        duration = time.time() - start_time
+        found = row is not None
+        await event_logger.log(
+            EventType.DATABASE_OPERATION,
+            f"Configuration lookup for {key}: {'found' if found else 'not found'}",
+            Priority.NORMAL,
+            metadata={"operation": "select", "table": "configuration", "duration": duration, "found": found}
+        )
+        
+        return row[0] if row else None
+    except Exception as e:
+        duration = time.time() - start_time
+        await event_logger.log_error_handling_start(
+            error_type=type(e).__name__,
+            error_msg=str(e),
+            context=f"Getting configuration {key}",
+            metadata={"operation": "select", "table": "configuration", "duration": duration, "key": key}
+        )
+        raise
 
 
 async def load_configuration_file(path: str) -> None:
@@ -194,29 +267,74 @@ async def create_character_profile(
 ) -> CharacterProfile:
     """Insert ``profile`` and return it with the new ID."""
 
-    result = await session.execute(
-        sa_text(
-            "INSERT INTO character_profile (name, full_name, aliases, gender, age, birth_date, death_date, species, role, rank, backstory, beliefs, desires, intentions, motivations, fatal_flaw, arc, voice) "
-            "VALUES (:name, :full_name, :aliases, :gender, :age, :birth_date, :death_date, :species, :role, :rank, :backstory, :beliefs, :desires, :intentions, :motivations, :fatal_flaw, :arc, :voice) "
-            "ON CONFLICT (name) DO UPDATE SET full_name = EXCLUDED.full_name, backstory = EXCLUDED.backstory, beliefs = EXCLUDED.beliefs, desires = EXCLUDED.desires, intentions = EXCLUDED.intentions, motivations = EXCLUDED.motivations, fatal_flaw = EXCLUDED.fatal_flaw, arc = EXCLUDED.arc, voice = EXCLUDED.voice, updated_at = NOW() RETURNING id, created_at"
-        ),
-        {
-            "name": profile.name,
-            "full_name": profile.full_name,
-            "aliases": profile.aliases,
-            "gender": profile.gender,
-            "age": profile.age,
-            "species": profile.species,
+    start_time = time.time()
+    await event_logger.log(
+        EventType.DATABASE_OPERATION,
+        f"Creating character profile: {profile.name}",
+        Priority.NORMAL,
+        metadata={
+            "operation": "upsert",
+            "table": "character_profile",
+            "character_name": profile.name,
             "role": profile.role,
-            "backstory": profile.backstory,
-            "fatal_flaw": profile.fatal_flaw,
-
-        },
+            "has_backstory": bool(profile.backstory)
+        }
     )
-    row = await _maybe_await(result.fetchone())
-    if row:
-        profile.id, profile.created_at = row
-    return profile
+
+    try:
+        result = await session.execute(
+            sa_text(
+                "INSERT INTO character_profile (name, full_name, aliases, gender, age, birth_date, death_date, species, role, rank, backstory, beliefs, desires, intentions, motivations, fatal_flaw, arc, voice) "
+                "VALUES (:name, :full_name, :aliases, :gender, :age, :birth_date, :death_date, :species, :role, :rank, :backstory, :beliefs, :desires, :intentions, :motivations, :fatal_flaw, :arc, :voice) "
+                "ON CONFLICT (name) DO UPDATE SET full_name = EXCLUDED.full_name, backstory = EXCLUDED.backstory, beliefs = EXCLUDED.beliefs, desires = EXCLUDED.desires, intentions = EXCLUDED.intentions, motivations = EXCLUDED.motivations, fatal_flaw = EXCLUDED.fatal_flaw, arc = EXCLUDED.arc, voice = EXCLUDED.voice, updated_at = NOW() RETURNING id, created_at"
+            ),
+            {
+                "name": profile.name,
+                "full_name": profile.full_name,
+                "aliases": profile.aliases,
+                "gender": profile.gender,
+                "age": profile.age,
+                "species": profile.species,
+                "role": profile.role,
+                "backstory": profile.backstory,
+                "fatal_flaw": profile.fatal_flaw,
+
+            },
+        )
+        row = await _maybe_await(result.fetchone())
+        if row:
+            profile.id, profile.created_at = row
+        
+        duration = time.time() - start_time
+        await event_logger.log(
+            EventType.DATABASE_OPERATION,
+            f"Successfully created character profile: {profile.name} (ID: {profile.id})",
+            Priority.NORMAL,
+            metadata={
+                "operation": "upsert",
+                "table": "character_profile",
+                "duration": duration,
+                "character_id": str(profile.id),
+                "character_name": profile.name,
+                "success": True
+            }
+        )
+        
+        return profile
+    except Exception as e:
+        duration = time.time() - start_time
+        await event_logger.log_error_handling_start(
+            error_type=type(e).__name__,
+            error_msg=str(e),
+            context=f"Creating character profile {profile.name}",
+            metadata={
+                "operation": "upsert",
+                "table": "character_profile",
+                "duration": duration,
+                "character_name": profile.name
+            }
+        )
+        raise
 
 
 async def get_character_profile(
@@ -626,32 +744,91 @@ async def get_chapter(session: AsyncSession, chapter_id: str | UUID) -> Chapter 
 async def create_scene(session: AsyncSession, scene_data: Scene) -> Scene:
     """Insert ``scene_data`` into the database and return it with the new ID."""
 
-    result = await session.execute(
-        sa_text(
-            "INSERT INTO scene (title, description, text, status, "
-            "scene_number, setting, characters, location_id, chapter_id) "
-            "VALUES (:title, :description, :text, :status, :scene_number, :setting, :characters, :location_id, :chapter_id) RETURNING id"
-        ),
-        {
-            "title": scene_data.title,
-            "description": scene_data.description,
-            "text": scene_data.text,
-            "status": scene_data.status.value,
+    start_time = time.time()
+    await event_logger.log(
+        EventType.DATABASE_OPERATION,
+        f"Creating scene: {scene_data.title}",
+        Priority.NORMAL,
+        metadata={
+            "operation": "insert",
+            "table": "scene",
+            "scene_title": scene_data.title,
             "scene_number": scene_data.scene_number,
-            "setting": scene_data.setting,
-            "characters": scene_data.characters,
-            "location_id": scene_data.location_id,
-            "chapter_id": scene_data.chapter_id,
-        },
+            "status": scene_data.status.value,
+            "character_count": len(scene_data.characters) if scene_data.characters else 0,
+            "has_text": bool(scene_data.text),
+            "text_length": len(scene_data.text) if scene_data.text else 0
+        }
     )
-    row = await _maybe_await(result.fetchone())
-    if row:
-        scene_data.id = row[0]
-    await session.commit()
-    if scene_data.text:
-        assert scene_data.id is not None
-        await store_scene_text_conn(session, scene_data.id, scene_data.text)
-    return scene_data
+
+    try:
+        result = await session.execute(
+            sa_text(
+                "INSERT INTO scene (title, description, text, status, "
+                "scene_number, setting, characters, location_id, chapter_id) "
+                "VALUES (:title, :description, :text, :status, :scene_number, :setting, :characters, :location_id, :chapter_id) RETURNING id"
+            ),
+            {
+                "title": scene_data.title,
+                "description": scene_data.description,
+                "text": scene_data.text,
+                "status": scene_data.status.value,
+                "scene_number": scene_data.scene_number,
+                "setting": scene_data.setting,
+                "characters": scene_data.characters,
+                "location_id": scene_data.location_id,
+                "chapter_id": scene_data.chapter_id,
+            },
+        )
+        row = await _maybe_await(result.fetchone())
+        if row:
+            scene_data.id = row[0]
+        await session.commit()
+        
+        if scene_data.text:
+            assert scene_data.id is not None
+            await event_logger.log(
+                EventType.DATABASE_OPERATION,
+                f"Storing scene text for scene {scene_data.id}",
+                Priority.NORMAL,
+                metadata={
+                    "operation": "store_text",
+                    "scene_id": str(scene_data.id),
+                    "text_length": len(scene_data.text)
+                }
+            )
+            await store_scene_text_conn(session, scene_data.id, scene_data.text)
+        
+        duration = time.time() - start_time
+        await event_logger.log(
+            EventType.DATABASE_OPERATION,
+            f"Successfully created scene: {scene_data.title} (ID: {scene_data.id})",
+            Priority.NORMAL,
+            metadata={
+                "operation": "insert",
+                "table": "scene",
+                "duration": duration,
+                "scene_id": str(scene_data.id),
+                "scene_title": scene_data.title,
+                "success": True
+            }
+        )
+        
+        return scene_data
+    except Exception as e:
+        duration = time.time() - start_time
+        await event_logger.log_error_handling_start(
+            error_type=type(e).__name__,
+            error_msg=str(e),
+            context=f"Creating scene {scene_data.title}",
+            metadata={
+                "operation": "insert",
+                "table": "scene",
+                "duration": duration,
+                "scene_title": scene_data.title
+            }
+        )
+        raise
 
 
 async def update_scene(session: AsyncSession, scene_data: Scene) -> None:
@@ -737,7 +914,7 @@ async def update_scene_status(
     session: AsyncSession, scene_id: UUID | str, status: SceneStatus
 ) -> None:
     """Set ``scene_id`` to ``status``."""
-
+    
     await session.execute(
         sa_text(
             "UPDATE scene SET status = :status, updated_at = NOW() WHERE id = :sid"
@@ -766,6 +943,7 @@ async def get_all_chapters(session: AsyncSession) -> list[Chapter]:
         )
         for r in rows
     ]
+
 
 async def get_all_characters(session: AsyncSession) -> list[CharacterProfile]:
     """Return all character profiles in the database."""
@@ -800,6 +978,7 @@ async def get_all_characters(session: AsyncSession) -> list[CharacterProfile]:
         )
         for r in rows
     ]
+
 
 async def get_scenes_by_status(
     session: AsyncSession, status: SceneStatus
@@ -836,7 +1015,7 @@ async def get_scenes_by_status(
 
 async def get_all_scenes(session: AsyncSession) -> list[Scene]:
     """Return all scenes in the database."""
-
+    
     result = await session.execute(
         sa_text(
             "SELECT id, title, description, text, status, scene_number, "

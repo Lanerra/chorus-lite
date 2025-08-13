@@ -19,7 +19,7 @@ from chorus.canon.postgres import (
     update_character_profile,
 )
 from chorus.core.llm import call_llm_structured
-from chorus.core.logs import log_message
+from chorus.core.logs import get_event_logger, log_message, EventType, LogLevel, Priority
 from chorus.models import (
     CharacterProfile,
     Concept,
@@ -74,6 +74,7 @@ class StoryArchitect(Agent):
             models.
         """
         super().__init__(model=model, default_model_env="STORY_ARCHITECT_MODEL")
+        self.event_logger = get_event_logger()
 
     # --- Story Planning Methods ---
 
@@ -84,6 +85,14 @@ class StoryArchitect(Agent):
         helper wraps :func:`call_llm_structured` with a clear instruction so the LLM
         returns a JSON array matching :class:`ConceptList`.
         """
+        self.event_logger.log(
+            LogLevel.INFO,
+            f"Starting concept generation for idea: '{idea[:100]}{'...' if len(idea) > 100 else ''}'",
+            event_type=EventType.AGENT_OPERATION,
+            priority=Priority.HIGH,
+            metadata={"agent": "StoryArchitect", "operation": "generate_concepts", "idea_length": len(idea)}
+        )
+        
         prompt = (
             "Generate three distinct story concepts for this idea. "
             "For each concept, provide a 'title' and a 'logline'. "
@@ -93,7 +102,30 @@ class StoryArchitect(Agent):
             f"{idea}\n"
             "Respond only with JSON that matches the ConceptList schema. DO NOT include any commentary or additional text."
         )
+        
+        self.event_logger.log(
+            LogLevel.DEBUG,
+            "Sending concept generation request to LLM",
+            event_type=EventType.LLM_REQUEST,
+            priority=Priority.NORMAL,
+            metadata={"agent": "StoryArchitect", "model": self.model, "prompt_length": len(prompt)}
+        )
+        
         result = await call_llm_structured(self.model, prompt, ConceptList)
+        
+        self.event_logger.log(
+            LogLevel.INFO,
+            f"Successfully generated {len(result.root)} concepts from idea",
+            event_type=EventType.AGENT_OPERATION,
+            priority=Priority.HIGH,
+            metadata={
+                "agent": "StoryArchitect",
+                "operation": "generate_concepts",
+                "concepts_generated": len(result.root),
+                "concept_titles": [c.title for c in result.root]
+            }
+        )
+        
         return result.root
 
 
@@ -247,8 +279,17 @@ class StoryArchitect(Agent):
                                 # As a last resort, attempt on-the-fly slug fallback:
                                 # if the system commonly stores slugified names, try slugifying the descriptor directly
                                 # and see if it matches any stored key after hyphen collapsing already done in _normalize_name.
-                                await self.log_message(
-                                    f"Character '{char_name_desc}' not found; skipping"
+                                self.event_logger.log(
+                                    LogLevel.WARNING,
+                                    f"Character '{char_name_desc}' not found in profiles; skipping scene assignment",
+                                    event_type=EventType.AGENT_OPERATION,
+                                    priority=Priority.NORMAL,
+                                    metadata={
+                                        "agent": "StoryArchitect",
+                                        "operation": "outline_to_tasks",
+                                        "character_name": char_name_desc,
+                                        "available_profiles": len(profiles)
+                                    }
                                 )
 
                     # Coerce fields to satisfy NOT NULL constraints and avoid None payloads
@@ -317,6 +358,14 @@ class StoryArchitect(Agent):
 
     async def generate_profiles(self, concept: Concept) -> list[CharacterProfile]:
         """Create profiles for the given ``concept`` and persist them."""
+        self.event_logger.log(
+            LogLevel.INFO,
+            f"Starting character profile generation for concept: '{concept.title}'",
+            event_type=EventType.AGENT_OPERATION,
+            priority=Priority.HIGH,
+            metadata={"agent": "StoryArchitect", "operation": "generate_profiles", "concept_title": concept.title}
+        )
+        
         bdi_instr = "Set beliefs, desires, intentions to empty lists."
 
         # Keep prompt aligned with tests: pass the entire concept JSON, not just logline,
@@ -326,20 +375,68 @@ class StoryArchitect(Agent):
             + concept.model_dump_json()
             + "\nReturn ONLY a JSON array of objects; do not wrap in an object. Each object MUST include name and empty arrays (beliefs, desires, intentions), plus motivations, arc, voice. Do not include additional keys."
         )
+        
+        self.event_logger.log(
+            LogLevel.DEBUG,
+            "Requesting character profiles from LLM",
+            event_type=EventType.LLM_REQUEST,
+            priority=Priority.NORMAL,
+            metadata={"agent": "StoryArchitect", "model": self.model, "prompt_length": len(prompt)}
+        )
+        
         result = await call_llm_structured(self.model, prompt, CharacterProfileList)
         profiles_from_llm = result.root
         if not profiles_from_llm:
+            self.event_logger.log(
+                LogLevel.WARNING,
+                "No character profiles generated by LLM",
+                event_type=EventType.AGENT_OPERATION,
+                priority=Priority.NORMAL,
+                metadata={"agent": "StoryArchitect", "operation": "generate_profiles"}
+            )
             return []
         # Tests expect an exact pass-through of the LLM-returned CharacterProfile objects here.
         validated_profiles: list[CharacterProfile] = list(profiles_from_llm)
+
+        self.event_logger.log(
+            LogLevel.INFO,
+            f"Generated {len(validated_profiles)} character profiles, preparing database persistence",
+            event_type=EventType.DATABASE_OPERATION,
+            priority=Priority.NORMAL,
+            metadata={
+                "agent": "StoryArchitect",
+                "operation": "generate_profiles",
+                "profiles_count": len(validated_profiles),
+                "profile_names": [p.name for p in validated_profiles]
+            }
+        )
 
         # 1. Create and commit character profiles first in a dedicated transaction.
         profiles = []
         async with get_pg() as conn:
             for profile_data in validated_profiles:
+                self.event_logger.log(
+                    LogLevel.DEBUG,
+                    f"Persisting character profile: {profile_data.name}",
+                    event_type=EventType.DATABASE_OPERATION,
+                    priority=Priority.LOW,
+                    metadata={"agent": "StoryArchitect", "character_name": profile_data.name}
+                )
                 profile = await create_character_profile(conn, profile_data)
                 profiles.append(profile)
             await conn.commit()
+            
+        self.event_logger.log(
+            LogLevel.INFO,
+            f"Successfully persisted {len(profiles)} character profiles to database",
+            event_type=EventType.DATABASE_OPERATION,
+            priority=Priority.NORMAL,
+            metadata={
+                "agent": "StoryArchitect",
+                "operation": "generate_profiles",
+                "persisted_count": len(profiles)
+            }
+        )
 
         # Return exactly what the LLM produced (tests expect pass-through objects)
         # Preserve ordering as provided by the LLM and avoid mutating items.
@@ -407,7 +504,18 @@ class StoryArchitect(Agent):
                 self.model, prompt, CharacterProfileList
             )
         except Exception as exc:
-            await self.log_message(f"Profile evolution failed: {exc}")
+            self.event_logger.log(
+                LogLevel.ERROR,
+                f"Character profile evolution failed: {exc}",
+                event_type=EventType.AGENT_OPERATION,
+                priority=Priority.HIGH,
+                metadata={
+                    "agent": "StoryArchitect",
+                    "operation": "evolve_profiles",
+                    "error": str(exc),
+                    "error_type": type(exc).__name__
+                }
+            )
             return []
         # In tests, the patched call returns CharacterProfileList; pass through as-is
         if profiles and getattr(profiles, "root", None):
@@ -469,9 +577,18 @@ class StoryArchitect(Agent):
             elif original_category.upper() in {"FACTION", "GROUP"}:
                 wa.category = "ORGANIZATION"
             else:
-                await self.log_message(
-                    f"Invalid WorldAnvil category '{original_category}' for entry '{wa.name}'. "
-                    "Discarding category."
+                self.event_logger.log(
+                    LogLevel.WARNING,
+                    f"Invalid WorldAnvil category '{original_category}' for entry '{wa.name}'; applying automatic correction",
+                    event_type=EventType.AGENT_OPERATION,
+                    priority=Priority.NORMAL,
+                    metadata={
+                        "agent": "StoryArchitect",
+                        "operation": "_apply_world_rules",
+                        "entry_name": wa.name,
+                        "invalid_category": original_category,
+                        "valid_categories": list(valid_categories)
+                    }
                 )
                 wa.category = None
 
@@ -816,7 +933,13 @@ class StoryArchitect(Agent):
 
     async def log_message(self, message: str) -> None:
         """Log a message using the logging system."""
-        await log_message(message)
+        self.event_logger.log(
+            LogLevel.INFO,
+            message,
+            event_type=EventType.AGENT_OPERATION,
+            priority=Priority.NORMAL,
+            metadata={"agent": "StoryArchitect"}
+        )
 
     async def call_llm(self, prompt: str) -> str:
         """Call the LLM with a simple prompt and return text response."""

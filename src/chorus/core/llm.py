@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import date, datetime
 from typing import Any, TypeVar, get_origin
 
@@ -12,7 +13,11 @@ import dirtyjson
 from pydantic import BaseModel, ValidationError
 
 from chorus.config import config
+from chorus.core.logs import get_event_logger, EventType, Priority
 from chorus.core.output_utils import write_debug_snapshot
+
+# Initialize EventLogger for LLM operations
+event_logger = get_event_logger()
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -612,12 +617,35 @@ async def call_llm(model: str, prompt: str) -> str:
     RuntimeError
         If required environment variables are missing.
     """
+    
+    start_time = time.time()
+    temperature = _get_global_temperature()
+    prompt_length = len(prompt) if prompt else 0
+    
+    await event_logger.log(
+        EventType.LLM_REQUEST,
+        f"Starting LLM call to {model}",
+        Priority.NORMAL,
+        metadata={
+            "operation": "call_llm",
+            "model": model,
+            "prompt_length": prompt_length,
+            "temperature": temperature,
+            "structured": False
+        }
+    )
 
     import litellm
 
     api_base = config.llm.api_base
     api_key = config.llm.api_key
     if not api_base or not api_key:
+        await event_logger.log_error_handling_start(
+            error_type="RuntimeError",
+            error_msg="OPENAI_API_BASE and OPENAI_API_KEY must be set",
+            context=f"LLM call to {model}",
+            metadata={"operation": "call_llm", "model": model, "error_category": "configuration"}
+        )
         raise RuntimeError("OPENAI_API_BASE and OPENAI_API_KEY must be set")
 
     # Debug: write prompt snapshot
@@ -633,28 +661,75 @@ async def call_llm(model: str, prompt: str) -> str:
         # Never fail the core path due to debug logging
         pass
 
-    response: dict[str, Any] = await litellm.acompletion(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        api_base=api_base,
-        api_key=api_key,
-        temperature=_get_global_temperature(),
-    )
-    content = response["choices"][0]["message"]["content"]
-
-    # Debug: write response snapshot
     try:
-        header = f"model={model}"
-        await write_debug_snapshot(
-            base_slug=f"llm_{model}",
-            part="response",
-            header=header,
-            body=content or "",
+        await event_logger.log(
+            EventType.LLM_REQUEST,
+            f"Sending request to {model}",
+            Priority.NORMAL,
+            metadata={
+                "operation": "call_llm",
+                "model": model,
+                "api_base": api_base,
+                "phase": "request_send"
+            }
         )
-    except Exception:
-        pass
+        
+        response: dict[str, Any] = await litellm.acompletion(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            api_base=api_base,
+            api_key=api_key,
+            temperature=temperature,
+        )
+        content = response["choices"][0]["message"]["content"]
+        
+        duration = time.time() - start_time
+        response_length = len(content) if content else 0
+        
+        await event_logger.log(
+            EventType.LLM_REQUEST,
+            f"Successfully received response from {model}",
+            Priority.NORMAL,
+            metadata={
+                "operation": "call_llm",
+                "model": model,
+                "duration": duration,
+                "prompt_length": prompt_length,
+                "response_length": response_length,
+                "temperature": temperature,
+                "success": True
+            }
+        )
 
-    return content
+        # Debug: write response snapshot
+        try:
+            header = f"model={model}"
+            await write_debug_snapshot(
+                base_slug=f"llm_{model}",
+                part="response",
+                header=header,
+                body=content or "",
+            )
+        except Exception:
+            pass
+
+        return content
+        
+    except Exception as e:
+        duration = time.time() - start_time
+        await event_logger.log_error_handling_start(
+            error_type=type(e).__name__,
+            error_msg=str(e),
+            context=f"LLM call to {model}",
+            metadata={
+                "operation": "call_llm",
+                "model": model,
+                "duration": duration,
+                "prompt_length": prompt_length,
+                "temperature": temperature
+            }
+        )
+        raise
 
 
 async def call_llm_structured[T: BaseModel](  # type: ignore[valid-type]
@@ -694,11 +769,41 @@ async def call_llm_structured[T: BaseModel](  # type: ignore[valid-type]
     ValidationError
         If validation fails after all retry attempts.
     """
+    
+    start_time = time.time()
+    prompt_length = len(prompt) if prompt else 0
+    model_name = getattr(response_model, '__name__', str(response_model))
+    
+    await event_logger.log(
+        EventType.LLM_REQUEST,
+        f"Starting structured LLM call to {model} for {model_name}",
+        Priority.NORMAL,
+        metadata={
+            "operation": "call_llm_structured",
+            "model": model,
+            "response_model": model_name,
+            "prompt_length": prompt_length,
+            "max_retries": max_retries,
+            "structured": True
+        }
+    )
+    
     import litellm
 
     api_base = config.llm.api_base
     api_key = config.llm.api_key
     if not api_base or not api_key:
+        await event_logger.log_error_handling_start(
+            error_type="RuntimeError",
+            error_msg="OPENAI_API_BASE and OPENAI_API_KEY must be set",
+            context=f"Structured LLM call to {model} for {model_name}",
+            metadata={
+                "operation": "call_llm_structured",
+                "model": model,
+                "response_model": model_name,
+                "error_category": "configuration"
+            }
+        )
         raise RuntimeError("OPENAI_API_BASE and OPENAI_API_KEY must be set")
 
     # Generate JSON schema from the Pydantic model
@@ -709,6 +814,20 @@ async def call_llm_structured[T: BaseModel](  # type: ignore[valid-type]
     # Resolve effective temperature (global default if not explicitly provided)
     effective_temperature = (
         _get_global_temperature() if temperature is None else temperature
+    )
+    
+    await event_logger.log(
+        EventType.LLM_REQUEST,
+        f"Generated JSON schema for {model_name}",
+        Priority.NORMAL,
+        metadata={
+            "operation": "call_llm_structured",
+            "model": model,
+            "response_model": model_name,
+            "temperature": effective_temperature,
+            "schema_type": schema.get("type", "unknown"),
+            "phase": "schema_generation"
+        }
     )
 
     # Debug: write prompt snapshot (structured)
@@ -816,7 +935,36 @@ async def call_llm_structured[T: BaseModel](  # type: ignore[valid-type]
     example_for_retry = None
 
     for attempt in range(max_retries + 1):
+        attempt_start = time.time()
+        await event_logger.log(
+            EventType.LLM_REQUEST,
+            f"Structured LLM attempt {attempt + 1}/{max_retries + 1} for {model_name}",
+            Priority.NORMAL,
+            metadata={
+                "operation": "call_llm_structured",
+                "model": model,
+                "response_model": model_name,
+                "attempt": attempt + 1,
+                "max_attempts": max_retries + 1,
+                "phase": "attempt_start"
+            }
+        )
+        
         try:
+            await event_logger.log(
+                EventType.LLM_REQUEST,
+                f"Sending structured request to {model} (attempt {attempt + 1})",
+                Priority.NORMAL,
+                metadata={
+                    "operation": "call_llm_structured",
+                    "model": model,
+                    "response_model": model_name,
+                    "attempt": attempt + 1,
+                    "temperature": effective_temperature,
+                    "phase": "request_send"
+                }
+            )
+            
             response = await litellm.acompletion(
                 model=model,
                 messages=[{"role": "user", "content": structured_prompt}],
@@ -827,6 +975,23 @@ async def call_llm_structured[T: BaseModel](  # type: ignore[valid-type]
             )
 
             content = response["choices"][0]["message"]["content"].strip()
+            content_length = len(content)
+            request_time = time.time() - attempt_start
+            
+            await event_logger.log(
+                EventType.LLM_REQUEST,
+                f"Received response from {model} (attempt {attempt + 1})",
+                Priority.NORMAL,
+                metadata={
+                    "operation": "call_llm_structured",
+                    "model": model,
+                    "response_model": model_name,
+                    "attempt": attempt + 1,
+                    "request_duration": request_time,
+                    "response_length": content_length,
+                    "phase": "response_received"
+                }
+            )
 
             # Debug: write response snapshot for JSON schema branch
             try:
@@ -846,12 +1011,37 @@ async def call_llm_structured[T: BaseModel](  # type: ignore[valid-type]
                 content = re.sub(r"```$", "", content).strip()
 
             # Parse and validate JSON response
+            await event_logger.log(
+                EventType.LLM_REQUEST,
+                f"Parsing JSON response from {model} (attempt {attempt + 1})",
+                Priority.NORMAL,
+                metadata={
+                    "operation": "call_llm_structured",
+                    "model": model,
+                    "response_model": model_name,
+                    "attempt": attempt + 1,
+                    "phase": "json_parsing"
+                }
+            )
+            
             try:
                 if (
                     response_model.__name__ == "CharacterProfileList"
                     and '"character"' in content
                     and not content.strip().startswith("[")
                 ):
+                    await event_logger.log(
+                        EventType.LLM_REQUEST,
+                        f"Applying CharacterProfileList parsing logic",
+                        Priority.NORMAL,
+                        metadata={
+                            "operation": "call_llm_structured",
+                            "model": model,
+                            "response_model": model_name,
+                            "attempt": attempt + 1,
+                            "phase": "special_parsing"
+                        }
+                    )
                     matches = re.findall(
                         r"\"character\"\s*:\s*({.*?})(?=,\s*\"character\"\s*:|\s*}$)",
                         content,
@@ -863,17 +1053,98 @@ async def call_llm_structured[T: BaseModel](  # type: ignore[valid-type]
                         json_data = json.loads(content)
                 else:
                     json_data = json.loads(content)
-            except json.JSONDecodeError:
+                    
+                await event_logger.log(
+                    EventType.LLM_REQUEST,
+                    f"Successfully parsed JSON response (attempt {attempt + 1})",
+                    Priority.NORMAL,
+                    metadata={
+                        "operation": "call_llm_structured",
+                        "model": model,
+                        "response_model": model_name,
+                        "attempt": attempt + 1,
+                        "parsed_type": type(json_data).__name__,
+                        "phase": "json_parsed"
+                    }
+                )
+                    
+            except json.JSONDecodeError as e:
+                await event_logger.log(
+                    EventType.LLM_REQUEST,
+                    f"JSON parsing failed, attempting recovery (attempt {attempt + 1})",
+                    Priority.NORMAL,
+                    metadata={
+                        "operation": "call_llm_structured",
+                        "model": model,
+                        "response_model": model_name,
+                        "attempt": attempt + 1,
+                        "json_error": str(e),
+                        "phase": "json_recovery"
+                    }
+                )
+                
                 match = re.search(r"({.*}|\[.*\])", content, re.DOTALL)
                 if match:
                     try:
                         json_data = json.loads(match.group(1))
+                        await event_logger.log(
+                            EventType.LLM_REQUEST,
+                            f"JSON recovery successful with regex extraction",
+                            Priority.NORMAL,
+                            metadata={
+                                "operation": "call_llm_structured",
+                                "model": model,
+                                "response_model": model_name,
+                                "attempt": attempt + 1,
+                                "recovery_method": "regex_json",
+                                "phase": "json_recovered"
+                            }
+                        )
                     except json.JSONDecodeError:
                         json_data = dirtyjson.loads(match.group(1))
+                        await event_logger.log(
+                            EventType.LLM_REQUEST,
+                            f"JSON recovery successful with dirty JSON",
+                            Priority.NORMAL,
+                            metadata={
+                                "operation": "call_llm_structured",
+                                "model": model,
+                                "response_model": model_name,
+                                "attempt": attempt + 1,
+                                "recovery_method": "dirtyjson",
+                                "phase": "json_recovered"
+                            }
+                        )
                 else:
                     try:
                         json_data = dirtyjson.loads(content)
-                    except Exception:
+                        await event_logger.log(
+                            EventType.LLM_REQUEST,
+                            f"JSON recovery successful with direct dirty JSON",
+                            Priority.NORMAL,
+                            metadata={
+                                "operation": "call_llm_structured",
+                                "model": model,
+                                "response_model": model_name,
+                                "attempt": attempt + 1,
+                                "recovery_method": "direct_dirtyjson",
+                                "phase": "json_recovered"
+                            }
+                        )
+                    except Exception as recovery_error:
+                        await event_logger.log(
+                            EventType.LLM_REQUEST,
+                            f"All JSON recovery attempts failed (attempt {attempt + 1})",
+                            Priority.HIGH,
+                            metadata={
+                                "operation": "call_llm_structured",
+                                "model": model,
+                                "response_model": model_name,
+                                "attempt": attempt + 1,
+                                "recovery_error": str(recovery_error),
+                                "phase": "json_recovery_failed"
+                            }
+                        )
                         last_error = ValidationError.from_exception_data(
                             "ValidationError",
                             [
@@ -967,17 +1238,96 @@ async def call_llm_structured[T: BaseModel](  # type: ignore[valid-type]
                         json_data = None
 
                 if json_data is not None:
+                    await event_logger.log(
+                        EventType.LLM_REQUEST,
+                        f"Validating parsed data against {model_name} schema (attempt {attempt + 1})",
+                        Priority.NORMAL,
+                        metadata={
+                            "operation": "call_llm_structured",
+                            "model": model,
+                            "response_model": model_name,
+                            "attempt": attempt + 1,
+                            "phase": "schema_validation"
+                        }
+                    )
+                    
                     try:
-                        return response_model.model_validate(json_data)
+                        validated_result = response_model.model_validate(json_data)
+                        total_duration = time.time() - start_time
+                        
+                        await event_logger.log(
+                            EventType.LLM_REQUEST,
+                            f"Successfully completed structured LLM call to {model} for {model_name}",
+                            Priority.NORMAL,
+                            metadata={
+                                "operation": "call_llm_structured",
+                                "model": model,
+                                "response_model": model_name,
+                                "total_duration": total_duration,
+                                "final_attempt": attempt + 1,
+                                "success": True,
+                                "phase": "completion"
+                            }
+                        )
+                        return validated_result
+                        
                     except ValidationError as e:
+                        await event_logger.log(
+                            EventType.LLM_REQUEST,
+                            f"Schema validation failed, attempting normalization (attempt {attempt + 1})",
+                            Priority.NORMAL,
+                            metadata={
+                                "operation": "call_llm_structured",
+                                "model": model,
+                                "response_model": model_name,
+                                "attempt": attempt + 1,
+                                "validation_error": str(e),
+                                "phase": "validation_failed"
+                            }
+                        )
+                        
                         # One more pass after normalization
                         try:
                             json_data = _maybe_normalize_for_model(
                                 response_model, json_data
                             )
-                            return response_model.model_validate(json_data)
+                            validated_result = response_model.model_validate(json_data)
+                            total_duration = time.time() - start_time
+                            
+                            await event_logger.log(
+                                EventType.LLM_REQUEST,
+                                f"Successfully validated after normalization (attempt {attempt + 1})",
+                                Priority.NORMAL,
+                                metadata={
+                                    "operation": "call_llm_structured",
+                                    "model": model,
+                                    "response_model": model_name,
+                                    "total_duration": total_duration,
+                                    "final_attempt": attempt + 1,
+                                    "normalized": True,
+                                    "success": True,
+                                    "phase": "completion"
+                                }
+                            )
+                            return validated_result
+                            
                         except RetryableValidationError as rve2:
                             if attempt < max_retries:
+                                await event_logger.log(
+                                    EventType.LLM_REQUEST,
+                                    f"Retryable validation error, preparing stricter retry (attempt {attempt + 1})",
+                                    Priority.NORMAL,
+                                    metadata={
+                                        "operation": "call_llm_structured",
+                                        "model": model,
+                                        "response_model": model_name,
+                                        "attempt": attempt + 1,
+                                        "retry_reason": rve2.reason,
+                                        "expected_root": rve2.expected_root,
+                                        "phase": "prepare_retry"
+                                    }
+                                )
+                                
                                 stricter_suffix_used = rve2.stricter_suffix
                                 example_for_retry = rve2.example_json
                                 error_msg = (
@@ -1018,13 +1368,71 @@ async def call_llm_structured[T: BaseModel](  # type: ignore[valid-type]
                     structured_prompt = f"{system_instr}\n{prompt}\nPrevious attempt failed with error: {error_msg}"
 
         except Exception as e:
+            attempt_duration = time.time() - attempt_start
+            await event_logger.log_error_handling_start(
+                error_type=type(e).__name__,
+                error_msg=str(e),
+                context=f"Structured LLM call to {model} for {model_name} (attempt {attempt + 1})",
+                metadata={
+                    "operation": "call_llm_structured",
+                    "model": model,
+                    "response_model": model_name,
+                    "attempt": attempt + 1,
+                    "attempt_duration": attempt_duration,
+                    "total_duration": time.time() - start_time
+                }
+            )
+            
             last_error = e
             if attempt < max_retries:
+                await event_logger.log(
+                    EventType.LLM_REQUEST,
+                    f"Attempt {attempt + 1} failed, retrying structured LLM call",
+                    Priority.NORMAL,
+                    metadata={
+                        "operation": "call_llm_structured",
+                        "model": model,
+                        "response_model": model_name,
+                        "attempt": attempt + 1,
+                        "will_retry": True,
+                        "phase": "retry_decision"
+                    }
+                )
                 continue
             else:
+                await event_logger.log(
+                    EventType.LLM_REQUEST,
+                    f"All attempts exhausted for structured LLM call to {model}",
+                    Priority.HIGH,
+                    metadata={
+                        "operation": "call_llm_structured",
+                        "model": model,
+                        "response_model": model_name,
+                        "total_attempts": max_retries + 1,
+                        "total_duration": time.time() - start_time,
+                        "final_error": str(e),
+                        "phase": "final_failure"
+                    }
+                )
                 raise
 
     # If we get here, all retries failed
+    total_duration = time.time() - start_time
+    await event_logger.log(
+        EventType.LLM_REQUEST,
+        f"Structured LLM call to {model} failed after all retries",
+        Priority.HIGH,
+        metadata={
+            "operation": "call_llm_structured",
+            "model": model,
+            "response_model": model_name,
+            "total_duration": total_duration,
+            "total_attempts": max_retries + 1,
+            "success": False,
+            "phase": "final_failure"
+        }
+    )
+    
     if last_error:
         raise last_error
     else:
@@ -1051,18 +1459,92 @@ async def embed_text(model: str, text: str) -> list[float]:
     RuntimeError
         If required environment variables are missing.
     """
+    
+    start_time = time.time()
+    text_length = len(text) if text else 0
+    
+    await event_logger.log(
+        EventType.LLM_REQUEST,
+        f"Starting embedding generation with {model}",
+        Priority.NORMAL,
+        metadata={
+            "operation": "embed_text",
+            "model": model,
+            "text_length": text_length,
+            "embedding": True
+        }
+    )
 
     import litellm
 
     api_base = config.embedding.api_base or config.llm.api_base
     api_key = config.embedding.api_key or config.llm.api_key
     if not api_base or not api_key:
+        await event_logger.log_error_handling_start(
+            error_type="RuntimeError",
+            error_msg="EMBEDDING_API_BASE/KEY or OPENAI_API_BASE/KEY must be set",
+            context=f"Embedding generation with {model}",
+            metadata={
+                "operation": "embed_text",
+                "model": model,
+                "error_category": "configuration",
+                "text_length": text_length
+            }
+        )
         raise RuntimeError("EMBEDDING_API_BASE/KEY or OPENAI_API_BASE/KEY must be set")
 
-    response: dict[str, Any] = await litellm.aembedding(
-        model=model,
-        input=text,
-        api_base=api_base,
-        api_key=api_key,
-    )
-    return response["data"][0]["embedding"]
+    try:
+        await event_logger.log(
+            EventType.LLM_REQUEST,
+            f"Sending embedding request to {model}",
+            Priority.NORMAL,
+            metadata={
+                "operation": "embed_text",
+                "model": model,
+                "api_base": api_base,
+                "text_length": text_length,
+                "phase": "request_send"
+            }
+        )
+        
+        response: dict[str, Any] = await litellm.aembedding(
+            model=model,
+            input=text,
+            api_base=api_base,
+            api_key=api_key,
+        )
+        
+        embedding = response["data"][0]["embedding"]
+        embedding_dimensions = len(embedding) if embedding else 0
+        duration = time.time() - start_time
+        
+        await event_logger.log(
+            EventType.LLM_REQUEST,
+            f"Successfully generated embedding with {model}",
+            Priority.NORMAL,
+            metadata={
+                "operation": "embed_text",
+                "model": model,
+                "duration": duration,
+                "text_length": text_length,
+                "embedding_dimensions": embedding_dimensions,
+                "success": True
+            }
+        )
+        
+        return embedding
+        
+    except Exception as e:
+        duration = time.time() - start_time
+        await event_logger.log_error_handling_start(
+            error_type=type(e).__name__,
+            error_msg=str(e),
+            context=f"Embedding generation with {model}",
+            metadata={
+                "operation": "embed_text",
+                "model": model,
+                "duration": duration,
+                "text_length": text_length
+            }
+        )
+        raise

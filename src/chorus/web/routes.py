@@ -5,7 +5,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from src.chorus.agents.story_architect import StoryArchitect
 from src.chorus.canon.crud import get_all_chapters, get_all_characters, get_all_scenes
-from src.chorus.canon import get_pg  # Add import for get_pg
+from src.chorus.canon.db import get_pg  # Add import for get_pg
 from src.chorus.core.env import get_settings
 from src.chorus.langgraph.graph import build_graph
 from src.chorus.web.websocket import websocket_manager  # Import the WebSocket manager
